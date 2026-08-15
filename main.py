@@ -15,6 +15,7 @@ from pyrogram import Client
 from pyrogram.errors import FloodWait
 
 # Database imports
+import psycopg2
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -29,38 +30,30 @@ API_HASH = os.getenv('API_HASH', '')
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 
-# Database URL - use directly from environment
+# Database URL
 DATABASE_URL = os.getenv('DATABASE_URL', '')
 
-# Fix URL if needed
 if DATABASE_URL:
     if DATABASE_URL.startswith('postgres://'):
         DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
-    # Remove any quotes or spaces
     DATABASE_URL = DATABASE_URL.strip().strip('"').strip("'")
-    logger.info(f"Database URL: {DATABASE_URL[:30]}...")
+    logger.info(f"Using PostgreSQL database")
 else:
-    # Use individual variables
-    PG_HOST = os.getenv('PGHOST', '')
-    PG_PORT = os.getenv('PGPORT', '5432')
-    PG_USER = os.getenv('PGUSER', '')
-    PG_PASSWORD = os.getenv('PGPASSWORD', '')
-    PG_DATABASE = os.getenv('PGDATABASE', '')
-    
-    if PG_HOST and PG_USER and PG_DATABASE:
-        DATABASE_URL = f'postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DATABASE}'
-        logger.info("Built database URL from individual variables")
-    else:
-        DATABASE_URL = 'sqlite:///bot.db'
-        logger.info("Using SQLite fallback")
+    DATABASE_URL = 'sqlite:///bot.db'
+    logger.info("Using SQLite database")
 
 # Create engine
 try:
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-    logger.info("Database engine created")
+    # Test connection
+    with engine.connect() as conn:
+        conn.execute("SELECT 1")
+    logger.info("Database connection successful")
 except Exception as e:
-    logger.error(f"Engine error: {e}")
-    engine = create_engine('sqlite:///bot.db')
+    logger.error(f"Database error: {e}")
+    DATABASE_URL = 'sqlite:///bot.db'
+    engine = create_engine(DATABASE_URL)
+    logger.info("Using SQLite fallback")
 
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
