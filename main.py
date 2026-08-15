@@ -105,7 +105,7 @@ class BroadcastTask(Base):
     groups_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# Create tables (без drop_all чтобы не терять данные)
+# Create tables
 Base.metadata.create_all(engine)
 logger.info("✅ Tables ready")
 
@@ -219,13 +219,99 @@ async def cmd_admin(message: types.Message):
         reply_markup=get_admin_keyboard()
     )
 
-# Callback handlers
+# ВСЕ Callback handlers
 @dp.callback_query_handler(lambda c: c.data == 'activate_license')
 async def process_activate_license(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     await bot.send_message(callback_query.from_user.id, "🔑 Введите ваш лицензионный ключ:")
     await UserStates.waiting_license.set()
 
+@dp.callback_query_handler(lambda c: c.data == 'connect_account')
+async def process_connect_account(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    logger.info(f"Connect account from user {callback_query.from_user.id}")
+    
+    if not is_valid_license(callback_query.from_user.id):
+        await bot.send_message(callback_query.from_user.id, "❌ У вас нет активной лицензии!")
+        return
+    
+    await bot.send_message(
+        callback_query.from_user.id,
+        "📱 <b>Подключение аккаунта</b>\n\n"
+        "Введите номер телефона в формате:\n"
+        "<code>+79123456789</code>"
+    )
+    await UserStates.waiting_phone.set()
+
+@dp.callback_query_handler(lambda c: c.data == 'create_broadcast')
+async def process_create_broadcast(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    logger.info(f"Create broadcast from user {callback_query.from_user.id}")
+    
+    if not is_valid_license(callback_query.from_user.id):
+        await bot.send_message(callback_query.from_user.id, "❌ У вас нет активной лицензии!")
+        return
+    
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(user_id=callback_query.from_user.id).first()
+        if not user or not user.session_string:
+            await bot.send_message(callback_query.from_user.id, "❌ Сначала подключите аккаунт!")
+            return
+    finally:
+        db.close()
+    
+    await bot.send_message(
+        callback_query.from_user.id,
+        "📝 <b>Создание рассылки</b>\n\n"
+        "Введите текст сообщения:"
+    )
+    await UserStates.waiting_message.set()
+
+@dp.callback_query_handler(lambda c: c.data == 'stop_broadcasts')
+async def process_stop_broadcasts(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    logger.info(f"Stop broadcasts from user {callback_query.from_user.id}")
+    
+    db = SessionLocal()
+    try:
+        db.query(BroadcastTask).filter_by(
+            user_id=callback_query.from_user.id,
+            status='active'
+        ).update({'status': 'paused'})
+        db.commit()
+    finally:
+        db.close()
+    
+    await bot.send_message(callback_query.from_user.id, "✅ Все рассылки остановлены.")
+
+@dp.callback_query_handler(lambda c: c.data == 'my_broadcasts')
+async def process_my_broadcasts(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    logger.info(f"My broadcasts from user {callback_query.from_user.id}")
+    
+    db = SessionLocal()
+    try:
+        tasks = db.query(BroadcastTask).filter_by(
+            user_id=callback_query.from_user.id
+        ).order_by(BroadcastTask.created_at.desc()).limit(10).all()
+    finally:
+        db.close()
+    
+    if not tasks:
+        await bot.send_message(callback_query.from_user.id, "У вас нет рассылок.")
+        return
+    
+    text = "📊 <b>Ваши рассылки:</b>\n\n"
+    for task in tasks:
+        status_emoji = "✅" if task.status == 'completed' else "🔄" if task.status == 'active' else "⏸"
+        text += f"{status_emoji} ID: {task.id}\n"
+        text += f"📝 {task.message_text[:50]}...\n"
+        text += f"⏱ Интервал: {task.interval_minutes} мин\n\n"
+    
+    await bot.send_message(callback_query.from_user.id, text)
+
+# Admin callback handlers
 @dp.callback_query_handler(lambda c: c.data == 'admin_create_key')
 async def process_admin_create_key(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
@@ -400,6 +486,128 @@ async def process_admin_key_duration(message: types.Message, state: FSMContext):
         logger.error(f"Error: {e}")
         await message.answer("❌ Произошла ошибка.")
         await state.finish()
+
+@dp.message_handler(state=UserStates.waiting_phone)
+async def process_phone(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+    logger.info(f"Phone entered: {phone}")
+    
+    if not phone.startswith('+'):
+        await message.answer("❌ Номер должен начинаться с '+'. Попробуйте снова.")
+        return
+    
+    await state.update_data(phone=phone)
+    
+    client = Client(
+        f"session_{message.from_user.id}",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        in_memory=True
+    )
+    
+    try:
+        await client.connect()
+        sent_code = await client.send_code(phone)
+        await state.update_data(phone_code_hash=sent_code.phone_code_hash)
+        await client.disconnect()
+        
+        await message.answer(
+            "📨 <b>Код отправлен!</b>\n\n"
+            "Введите код из SMS:"
+        )
+        await UserStates.waiting_code.set()
+    except Exception as e:
+        logger.error(f"Error sending code: {e}")
+        await message.answer(f"❌ Ошибка: {str(e)}")
+        await state.finish()
+
+@dp.message_handler(state=UserStates.waiting_code)
+async def process_code(message: types.Message, state: FSMContext):
+    code = message.text.strip()
+    data = await state.get_data()
+    phone = data.get('phone')
+    phone_code_hash = data.get('phone_code_hash')
+    
+    client = Client(
+        f"session_{message.from_user.id}",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        in_memory=True
+    )
+    
+    try:
+        await client.connect()
+        await client.sign_in(phone, phone_code_hash, code)
+        
+        session_string = await client.export_session_string()
+        
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(user_id=message.from_user.id).first()
+            if user:
+                user.phone_number = phone
+                user.session_string = session_string
+                db.commit()
+        finally:
+            db.close()
+        
+        active_clients[message.from_user.id] = client
+        
+        await message.answer("✅ <b>Аккаунт подключен!</b>")
+        await state.finish()
+        
+    except Exception as e:
+        logger.error(f"Error signing in: {e}")
+        await message.answer(f"❌ Ошибка входа: {str(e)}")
+        await state.finish()
+
+@dp.message_handler(state=UserStates.waiting_message)
+async def process_message_text(message: types.Message, state: FSMContext):
+    message_text = message.text
+    await state.update_data(message_text=message_text)
+    
+    await message.answer(
+        "⏱ <b>Интервал рассылки</b>\n\n"
+        "Введите интервал в минутах\n"
+        "(минимум 5 минут):"
+    )
+    await UserStates.waiting_interval.set()
+
+@dp.message_handler(state=UserStates.waiting_interval)
+async def process_interval(message: types.Message, state: FSMContext):
+    try:
+        interval = int(message.text)
+        if interval < 5:
+            await message.answer("❌ Минимум 5 минут. Введите снова:")
+            return
+        
+        data = await state.get_data()
+        message_text = data.get('message_text')
+        
+        db = SessionLocal()
+        try:
+            task = BroadcastTask(
+                user_id=message.from_user.id,
+                message_text=message_text,
+                interval_minutes=interval,
+                status='active'
+            )
+            db.add(task)
+            db.commit()
+            db.refresh(task)
+            task_id = task.id
+        finally:
+            db.close()
+        
+        await message.answer(
+            f"✅ <b>Рассылка создана!</b>\n\n"
+            f"📝 Сообщение: {message_text[:100]}\n"
+            f"⏱ Интервал: {interval} мин"
+        )
+        await state.finish()
+        
+    except ValueError:
+        await message.answer("❌ Введите число.")
 
 # Startup
 async def on_startup(dp):
