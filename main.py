@@ -19,6 +19,7 @@ from pyrogram.errors import FloodWait, PhoneCodeExpired, PhoneCodeInvalid, Sessi
 from sqlalchemy import create_engine, Column, Integer, BigInteger, String, DateTime, Boolean, Text, text
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy import inspect
 
 # Configuration
 logging.basicConfig(level=logging.INFO)
@@ -95,13 +96,31 @@ class BroadcastTask(Base):
     user_id = Column(BigInteger, nullable=False)
     message_text = Column(Text, nullable=False)
     interval_minutes = Column(Integer, default=30)
-    status = Column(String, default='active')  # active, paused, completed
+    status = Column(String, default='active')
     groups_count = Column(Integer, default=0)
     current_cycle = Column(Integer, default=0)
     sent_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-Base.metadata.create_all(engine)
+# Пересоздаем таблицу broadcast_tasks
+try:
+    # Проверяем существующие таблицы
+    inspector = inspect(engine)
+    existing_tables = inspector.get_table_names()
+    
+    if 'broadcast_tasks' in existing_tables:
+        # Получаем существующие колонки
+        columns = [col['name'] for col in inspector.get_columns('broadcast_tasks')]
+        
+        # Если нет новых колонок, пересоздаем таблицу
+        if 'current_cycle' not in columns or 'sent_count' not in columns:
+            logger.info("Recreating broadcast_tasks table...")
+            BroadcastTask.__table__.drop(engine)
+    
+    Base.metadata.create_all(engine)
+    logger.info("✅ Tables ready")
+except Exception as e:
+    logger.error(f"Error with tables: {e}")
 
 # States
 class UserStates(StatesGroup):
@@ -221,7 +240,7 @@ async def start_broadcast(user_id: int, task_id: int):
                 if dialog.chat.type in ['group', 'supergroup']:
                     dialogs.append({
                         'id': dialog.chat.id,
-                        'title': dialog.chat.title
+                        'title': dialog.chat.title or 'Без названия'
                     })
             logger.info(f"Found {len(dialogs)} groups for user {user_id}")
         except Exception as e:
@@ -329,10 +348,6 @@ async def start_broadcast(user_id: int, task_id: int):
                     await asyncio.sleep(e.value)
                 except Exception as e:
                     logger.error(f"Error sending to {group['title']}: {e}")
-                    await bot.send_message(
-                        user_id,
-                        f"❌ Ошибка отправки в {group['title']}: {str(e)}"
-                    )
                     continue
             
             # Цикл завершен
@@ -409,8 +424,7 @@ async def connect_account(message: types.Message):
     await message.answer(
         "📱 <b>Подключение аккаунта</b>\n\n"
         "Введите номер телефона в международном формате:\n"
-        "Например: <code>+79123456789</code>\n\n"
-        "⚠️ Убедитесь, что номер правильный!"
+        "Например: <code>+79123456789</code>"
     )
     await UserStates.waiting_phone.set()
 
@@ -608,7 +622,6 @@ async def process_phone(message: types.Message, state: FSMContext):
         await message.answer("❌ Номер должен начинаться с '+'. Попробуйте снова:")
         return
     
-    # Отправляем сообщение о начале обработки
     await message.answer("⏳ Отправляю код подтверждения...")
     
     client = Client(
@@ -708,7 +721,9 @@ async def process_interval(message: types.Message, state: FSMContext):
                 user_id=message.from_user.id,
                 message_text=message_text,
                 interval_minutes=interval,
-                status='active'
+                status='active',
+                current_cycle=0,
+                sent_count=0
             )
             db.add(task)
             db.commit()
