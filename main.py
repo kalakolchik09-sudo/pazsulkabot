@@ -14,8 +14,8 @@ from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 
-# Database imports
-from sqlalchemy import create_engine, Column, BigInteger, String, DateTime, Boolean, Text, text
+# Database imports - добавлены все необходимые типы
+from sqlalchemy import create_engine, Column, Integer, BigInteger, String, DateTime, Boolean, Text, text
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -73,11 +73,11 @@ except Exception as e:
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-# Models - используем BigInteger для user_id
+# Models - все типы правильно импортированы
 class User(Base):
     __tablename__ = 'users'
     id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, unique=True, nullable=False)  # Изменено на BigInteger
+    user_id = Column(BigInteger, unique=True, nullable=False)
     username = Column(String, nullable=True)
     first_name = Column(String, nullable=True)
     license_key = Column(String, unique=True, nullable=True)
@@ -93,23 +93,26 @@ class LicenseKey(Base):
     key = Column(String, unique=True, nullable=False)
     duration_days = Column(Integer, default=30)
     is_used = Column(Boolean, default=False)
-    used_by = Column(BigInteger, nullable=True)  # Изменено на BigInteger
+    used_by = Column(BigInteger, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class BroadcastTask(Base):
     __tablename__ = 'broadcast_tasks'
     id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, nullable=False)  # Изменено на BigInteger
+    user_id = Column(BigInteger, nullable=False)
     message_text = Column(Text, nullable=False)
     interval_minutes = Column(Integer, default=30)
     status = Column(String, default='active')
     groups_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# Удаляем старые таблицы и создаем новые
-Base.metadata.drop_all(engine)
-Base.metadata.create_all(engine)
-logger.info("✅ Tables created")
+# Пересоздаем таблицы
+try:
+    Base.metadata.drop_all(engine)
+    Base.metadata.create_all(engine)
+    logger.info("✅ Tables created")
+except Exception as e:
+    logger.error(f"Error creating tables: {e}")
 
 # States
 class UserStates(StatesGroup):
@@ -118,7 +121,7 @@ class UserStates(StatesGroup):
     waiting_message = State()
     waiting_interval = State()
     waiting_license = State()
-    admin_create_key = State()  # Добавлено состояние для админа
+    admin_create_key = State()
 
 # Initialize bot
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
@@ -288,7 +291,7 @@ async def process_admin_create_key(callback_query: types.CallbackQuery):
         "• <code>365</code> - на год\n"
         "• <code>-1</code> - навсегда"
     )
-    await UserStates.admin_create_key.set()  # Используем состояние из UserStates
+    await UserStates.admin_create_key.set()
 
 @dp.message_handler(state=UserStates.admin_create_key)
 async def process_admin_key_duration(message: types.Message, state: FSMContext):
