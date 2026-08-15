@@ -51,7 +51,6 @@ def get_database_url():
 
 DATABASE_URL = get_database_url()
 
-# Create engine
 try:
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     with engine.connect() as conn:
@@ -119,7 +118,6 @@ dp.middleware.setup(LoggingMiddleware())
 
 active_clients = {}
 phone_code_hashes = {}
-broadcast_tasks = {}
 
 # Helper functions
 def generate_license_key(duration_days: int) -> str:
@@ -190,6 +188,8 @@ def get_admin_keyboard():
 # Функция рассылки
 async def start_broadcast(user_id: int, task_id: int):
     """Запускает рассылку в фоне"""
+    logger.info(f"Starting broadcast for user {user_id}, task {task_id}")
+    
     db = SessionLocal()
     try:
         task = db.query(BroadcastTask).filter_by(id=task_id).first()
@@ -197,7 +197,13 @@ async def start_broadcast(user_id: int, task_id: int):
     finally:
         db.close()
     
-    if not task or not user or not user.session_string:
+    if not task or not user:
+        logger.error("Task or user not found")
+        return
+    
+    if not user.session_string:
+        logger.error("No session string")
+        await bot.send_message(user_id, "❌ Аккаунт не подключен!")
         return
     
     client = Client(
@@ -209,15 +215,40 @@ async def start_broadcast(user_id: int, task_id: int):
     
     try:
         await client.start()
-        logger.info(f"Broadcast client started for user {user_id}")
+        logger.info("Client started")
         
-        # Получаем все группы
+        # Получаем информацию о пользователе
+        me = await client.get_me()
+        logger.info(f"Logged in as: {me.first_name} (@{me.username})")
+        
+        await bot.send_message(user_id, f"✅ Подключен как: {me.first_name}")
+        
+        # Получаем ВСЕ диалоги
+        await bot.send_message(user_id, "📋 Получаю список групп...")
+        
         dialogs = []
         async for dialog in client.get_dialogs():
+            logger.info(f"Dialog: {dialog.chat.title} ({dialog.chat.type})")
             if dialog.chat.type in ['group', 'supergroup']:
                 dialogs.append(dialog.chat.id)
         
-        logger.info(f"Found {len(dialogs)} groups for user {user_id}")
+        logger.info(f"Found {len(dialogs)} groups")
+        
+        if len(dialogs) == 0:
+            await bot.send_message(
+                user_id,
+                "❌ <b>У вас нет групп!</b>\n\n"
+                "Добавьте аккаунт в группы и попробуйте снова."
+            )
+            
+            # Обновляем статус
+            db = SessionLocal()
+            try:
+                db.query(BroadcastTask).filter_by(id=task_id).update({'status': 'completed', 'groups_count': 0})
+                db.commit()
+            finally:
+                db.close()
+            return
         
         # Обновляем количество групп
         db = SessionLocal()
@@ -227,10 +258,16 @@ async def start_broadcast(user_id: int, task_id: int):
         finally:
             db.close()
         
+        await bot.send_message(
+            user_id,
+            f"✅ Найдено групп: <b>{len(dialogs)}</b>\n"
+            f"Начинаю рассылку..."
+        )
+        
         # Отправляем сообщения
         sent_count = 0
         for group_id in dialogs:
-            # Проверяем статус задачи
+            # Проверяем статус
             db = SessionLocal()
             try:
                 current_task = db.query(BroadcastTask).filter_by(id=task_id).first()
@@ -245,10 +282,10 @@ async def start_broadcast(user_id: int, task_id: int):
                 sent_count += 1
                 logger.info(f"Sent to {group_id}: {sent_count}/{len(dialogs)}")
                 
-                # Отправляем уведомление пользователю
+                # Уведомляем пользователя
                 await bot.send_message(
                     user_id,
-                    f"📨 Отправлено в группу {group_id} ({sent_count}/{len(dialogs)})"
+                    f"📨 Отправлено в группу ({sent_count}/{len(dialogs)})"
                 )
                 
                 # Ждем интервал
@@ -262,7 +299,7 @@ async def start_broadcast(user_id: int, task_id: int):
                 logger.error(f"Error sending to {group_id}: {e}")
                 continue
         
-        # Завершаем задачу
+        # Завершаем
         db = SessionLocal()
         try:
             db.query(BroadcastTask).filter_by(id=task_id).update({'status': 'completed'})
@@ -273,14 +310,17 @@ async def start_broadcast(user_id: int, task_id: int):
         await bot.send_message(
             user_id,
             f"✅ <b>Рассылка завершена!</b>\n\n"
-            f"📊 Отправлено в {sent_count} групп"
+            f"📊 Отправлено в {sent_count} групп из {len(dialogs)}"
         )
         
     except Exception as e:
         logger.error(f"Broadcast error: {e}")
         await bot.send_message(user_id, f"❌ Ошибка рассылки: {str(e)}")
     finally:
-        await client.stop()
+        try:
+            await client.stop()
+        except:
+            pass
 
 # User handlers
 @dp.message_handler(commands=['start'])
@@ -415,14 +455,12 @@ async def admin_stats(message: types.Message):
         total_users = db.query(User).count()
         total_keys = db.query(LicenseKey).count()
         used_keys = db.query(LicenseKey).filter_by(is_used=True).count()
-        total_broadcasts = db.query(BroadcastTask).count()
         
         await message.answer(
             f"📊 <b>Статистика:</b>\n\n"
             f"👥 Пользователей: <b>{total_users}</b>\n"
             f"🔑 Ключей: <b>{total_keys}</b>\n"
-            f"📤 Использовано: <b>{used_keys}</b>\n"
-            f"📨 Рассылок: <b>{total_broadcasts}</b>"
+            f"📤 Использовано: <b>{used_keys}</b>"
         )
     finally:
         db.close()
@@ -602,7 +640,7 @@ async def process_interval(message: types.Message, state: FSMContext):
         finally:
             db.close()
         
-        # Запускаем рассылку в фоне
+        # Запускаем рассылку
         asyncio.create_task(start_broadcast(message.from_user.id, task_id))
         
         await message.answer(
