@@ -15,7 +15,7 @@ from pyrogram import Client
 from pyrogram.errors import FloodWait
 
 # Database imports
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -29,11 +29,11 @@ API_HASH = os.getenv('API_HASH', '')
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 
-# Database URL - try multiple options
+# Database URL
 def get_database_url():
-    """Try different database URLs in order"""
+    """Get database URL from environment"""
     
-    # 1. Try DATABASE_PUBLIC_URL first (for external connections)
+    # Try DATABASE_PUBLIC_URL first
     public_url = os.getenv('DATABASE_PUBLIC_URL', '')
     if public_url:
         if public_url.startswith('postgres://'):
@@ -41,71 +41,32 @@ def get_database_url():
         logger.info("Using DATABASE_PUBLIC_URL")
         return public_url.strip()
     
-    # 2. Try DATABASE_URL
+    # Try DATABASE_URL
     db_url = os.getenv('DATABASE_URL', '')
     if db_url:
         if db_url.startswith('postgres://'):
             db_url = db_url.replace('postgres://', 'postgresql://', 1)
-        
-        # Check if it's internal URL
-        if 'railway.internal' in db_url:
-            # Try to use public URL instead
-            logger.info("Internal URL detected, trying public URL")
-            # Try to construct public URL from parts
-            pg_host = os.getenv('PGHOST', '')
-            if pg_host and 'railway.internal' in pg_host:
-                # Use proxy host
-                public_host = pg_host.replace('postgres.railway.internal', 'altaria.proxy.rlwy.net')
-                pg_port = os.getenv('PGPORT', '5432')
-                pg_user = os.getenv('PGUSER', 'postgres')
-                pg_password = os.getenv('PGPASSWORD', '')
-                pg_database = os.getenv('PGDATABASE', 'railway')
-                
-                # Use port 50439 for public access
-                public_url = f'postgresql://{pg_user}:{pg_password}@{public_host}:50439/{pg_database}'
-                logger.info("Constructed public URL")
-                return public_url
-        
         logger.info("Using DATABASE_URL")
         return db_url.strip()
     
-    # 3. Try individual variables
-    pg_host = os.getenv('PGHOST', '')
-    pg_port = os.getenv('PGPORT', '5432')
-    pg_user = os.getenv('PGUSER', '')
-    pg_password = os.getenv('PGPASSWORD', '')
-    pg_database = os.getenv('PGDATABASE', '')
-    
-    if pg_host and pg_user and pg_database:
-        # Use public proxy
-        if 'railway.internal' in pg_host:
-            pg_host = 'altaria.proxy.rlwy.net'
-            pg_port = '50439'
-        
-        db_url = f'postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_database}'
-        logger.info("Built URL from individual variables")
-        return db_url
-    
-    # 4. Fallback to SQLite
-    logger.warning("No database URL found, using SQLite")
+    # Fallback to SQLite
+    logger.info("Using SQLite")
     return 'sqlite:///bot.db'
 
 DATABASE_URL = get_database_url()
-logger.info(f"Database URL: {DATABASE_URL[:50]}...")
 
 # Create engine
 try:
-    engine = create_engine(
-        DATABASE_URL,
-        pool_pre_ping=True,
-        connect_args={'sslmode': 'disable'} if 'postgresql' in DATABASE_URL else {}
-    )
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    
     # Test connection
     with engine.connect() as conn:
-        conn.execute("SELECT 1")
-    logger.info("Database connection successful!")
+        conn.execute(text("SELECT 1"))
+    
+    logger.info("✅ Database connection successful!")
+    
 except Exception as e:
-    logger.error(f"Database error: {e}")
+    logger.error(f"❌ Database error: {e}")
     logger.info("Using SQLite fallback")
     DATABASE_URL = 'sqlite:///bot.db'
     engine = create_engine(DATABASE_URL)
@@ -146,6 +107,7 @@ class BroadcastTask(Base):
     groups_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+# Create tables
 Base.metadata.create_all(engine)
 
 # States
@@ -166,6 +128,7 @@ active_clients = {}
 
 # Helper functions
 def generate_license_key(duration_days: int) -> str:
+    """Generate unique license key"""
     db = SessionLocal()
     try:
         while True:
@@ -177,6 +140,7 @@ def generate_license_key(duration_days: int) -> str:
         db.close()
 
 def is_valid_license(user_id: int) -> bool:
+    """Check if user has valid license"""
     db = SessionLocal()
     try:
         user = db.query(User).filter_by(user_id=user_id).first()
@@ -281,6 +245,10 @@ async def process_license_key(message: types.Message, state: FSMContext):
         
         await message.answer(f"✅ Лицензия активирована до {expiry.strftime('%d.%m.%Y')}")
         await state.finish()
+    except Exception as e:
+        logger.error(f"License activation error: {e}")
+        await message.answer("❌ Ошибка активации. Попробуйте позже.")
+        await state.finish()
     finally:
         db.close()
 
@@ -298,68 +266,145 @@ async def process_admin_key_duration(message: types.Message, state: FSMContext):
     try:
         duration = int(message.text)
         key = generate_license_key(duration)
+        
         db = SessionLocal()
         try:
             license_obj = LicenseKey(key=key, duration_days=duration)
             db.add(license_obj)
             db.commit()
+            logger.info(f"License key created: {key}")
+        except Exception as e:
+            logger.error(f"Error creating key: {e}")
+            await message.answer("❌ Ошибка создания ключа")
+            await state.finish()
+            return
         finally:
             db.close()
         
         duration_text = "Бессрочная" if duration == -1 else f"{duration} дней"
-        await message.answer(f"✅ Ключ: <code>{key}</code>\nСрок: {duration_text}")
+        await message.answer(
+            f"✅ Ключ успешно создан!\n\n"
+            f"🔑 Ключ: <code>{key}</code>\n"
+            f"📅 Срок: {duration_text}\n\n"
+            f"Отправьте этот ключ пользователю."
+        )
         await state.finish()
+        
     except ValueError:
-        await message.answer("❌ Введите число")
+        await message.answer("❌ Введите число или -1 для бессрочного ключа")
+    except Exception as e:
+        logger.error(f"Error in key creation: {e}")
+        await message.answer("❌ Произошла ошибка. Попробуйте снова.")
+        await state.finish()
 
 @dp.callback_query_handler(lambda c: c.data == 'admin_users')
 async def process_admin_users(callback_query: types.CallbackQuery):
     if callback_query.from_user.id != ADMIN_ID:
         return
+    
     db = SessionLocal()
     try:
         users = db.query(User).all()
+        
+        if not users:
+            await bot.answer_callback_query(callback_query.id, "Нет пользователей")
+            return
+        
+        text = "👥 <b>Пользователи:</b>\n\n"
+        for user in users:
+            status = "🚫" if user.is_blocked else "✅"
+            license_status = "✅" if user.license_expiry and user.license_expiry > datetime.utcnow() else "❌"
+            text += f"{status} ID: <code>{user.user_id}</code>\n"
+            text += f"👤 {user.first_name or 'Нет имени'}"
+            if user.username:
+                text += f" (@{user.username})"
+            text += f"\n🔑 Лицензия: {license_status}"
+            if user.license_expiry:
+                text += f" (до {user.license_expiry.strftime('%d.%m.%Y')})"
+            text += "\n\n"
+        
+        await bot.send_message(callback_query.from_user.id, text)
+    except Exception as e:
+        logger.error(f"Error listing users: {e}")
+        await bot.send_message(callback_query.from_user.id, "❌ Ошибка загрузки пользователей")
     finally:
         db.close()
-    
-    if not users:
-        await bot.answer_callback_query(callback_query.id, "Нет пользователей")
-        return
-    
-    text = "👥 Пользователи:\n\n"
-    for user in users:
-        status = "🚫" if user.is_blocked else "✅"
-        text += f"{status} {user.user_id} - {user.first_name or 'Нет имени'}\n"
-    
-    await bot.send_message(callback_query.from_user.id, text)
 
 @dp.callback_query_handler(lambda c: c.data == 'admin_stats')
 async def process_admin_stats(callback_query: types.CallbackQuery):
     if callback_query.from_user.id != ADMIN_ID:
         return
+    
     db = SessionLocal()
     try:
         total_users = db.query(User).count()
+        active_licenses = db.query(User).filter(User.license_expiry > datetime.utcnow()).count()
         total_keys = db.query(LicenseKey).count()
         used_keys = db.query(LicenseKey).filter_by(is_used=True).count()
+        total_broadcasts = db.query(BroadcastTask).count()
+        
+        await bot.send_message(
+            callback_query.from_user.id,
+            f"📊 <b>Статистика:</b>\n\n"
+            f"👥 Пользователей: <b>{total_users}</b>\n"
+            f"✅ Активных лицензий: <b>{active_licenses}</b>\n"
+            f"🔑 Всего ключей: <b>{total_keys}</b>\n"
+            f"📤 Использовано: <b>{used_keys}</b>\n"
+            f"📨 Рассылок: <b>{total_broadcasts}</b>"
+        )
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        await bot.send_message(callback_query.from_user.id, "❌ Ошибка загрузки статистики")
     finally:
         db.close()
+
+@dp.callback_query_handler(lambda c: c.data == 'admin_block_user')
+async def process_admin_block_user(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id != ADMIN_ID:
+        return
     
-    await bot.send_message(
-        callback_query.from_user.id,
-        f"📊 Статистика:\n\n"
-        f"👥 Пользователей: {total_users}\n"
-        f"🔑 Ключей: {total_keys}\n"
-        f"📤 Использовано: {used_keys}"
-    )
+    await bot.answer_callback_query(callback_query.id)
+    await bot.send_message(callback_query.from_user.id, "Введите ID пользователя для блокировки/разблокировки:")
+    await dp.current_state(user=callback_query.from_user.id).set_state('admin_block_user')
+
+@dp.message_handler(lambda message: message.from_user.id == ADMIN_ID and dp.current_state(user=message.from_user.id).get_state() == 'admin_block_user')
+async def process_admin_block_user_id(message: types.Message, state: FSMContext):
+    try:
+        user_id = int(message.text)
+        
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(user_id=user_id).first()
+            if not user:
+                await message.answer("❌ Пользователь не найден.")
+                await state.finish()
+                return
+            
+            user.is_blocked = not user.is_blocked
+            db.commit()
+            status = "заблокирован" if user.is_blocked else "разблокирован"
+            
+            await message.answer(f"✅ Пользователь {user_id} {status}.")
+            await state.finish()
+        finally:
+            db.close()
+        
+    except ValueError:
+        await message.answer("❌ Введите корректный ID.")
+
+# Error handler
+@dp.errors_handler()
+async def errors_handler(update, error):
+    logger.error(f"Update: {update} \nError: {error}")
+    return True
 
 # Startup
 async def on_startup(dp):
-    logger.info("Bot started!")
+    logger.info("✅ Bot started successfully!")
     try:
-        await bot.send_message(ADMIN_ID, "✅ Бот запущен!")
-    except:
-        pass
+        await bot.send_message(ADMIN_ID, "✅ Бот запущен и готов к работе!\n\nИспользуйте /admin для управления.")
+    except Exception as e:
+        logger.error(f"Error sending startup message: {e}")
 
 # Main
 if __name__ == '__main__':
