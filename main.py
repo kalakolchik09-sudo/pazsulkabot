@@ -10,7 +10,7 @@ from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ParseMode, ReplyKeyboardMarkup, KeyboardButton
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 
@@ -117,6 +117,7 @@ class UserStates(StatesGroup):
     waiting_interval = State()
     waiting_license = State()
     admin_create_key = State()
+    admin_block_user = State()
 
 # Initialize bot
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
@@ -168,28 +169,35 @@ def create_user_if_not_exists(user_id: int, username: str = None, first_name: st
     finally:
         db.close()
 
-# Keyboards
+# Keyboards (Reply Keyboard)
 def get_main_keyboard(user_id: int):
-    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
+    
     if is_valid_license(user_id):
         keyboard.add(
-            InlineKeyboardButton("📱 Подключить аккаунт", callback_data="connect_account"),
-            InlineKeyboardButton("📨 Создать рассылку", callback_data="create_broadcast"),
-            InlineKeyboardButton("⏹ Остановить", callback_data="stop_broadcasts"),
-            InlineKeyboardButton("📊 Мои рассылки", callback_data="my_broadcasts")
+            KeyboardButton("📱 Подключить аккаунт"),
+            KeyboardButton("📨 Создать рассылку")
+        )
+        keyboard.add(
+            KeyboardButton("⏹ Остановить рассылки"),
+            KeyboardButton("📊 Мои рассылки")
         )
     else:
-        keyboard.add(InlineKeyboardButton("🔑 Активировать лицензию", callback_data="activate_license"))
+        keyboard.add(KeyboardButton("🔑 Активировать лицензию"))
+    
     return keyboard
 
 def get_admin_keyboard():
-    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     keyboard.add(
-        InlineKeyboardButton("🔑 Создать ключ", callback_data="admin_create_key"),
-        InlineKeyboardButton("👥 Пользователи", callback_data="admin_users"),
-        InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"),
-        InlineKeyboardButton("🚫 Заблокировать", callback_data="admin_block_user")
+        KeyboardButton("🔑 Создать ключ"),
+        KeyboardButton("👥 Пользователи")
     )
+    keyboard.add(
+        KeyboardButton("📊 Статистика"),
+        KeyboardButton("🚫 Заблокировать")
+    )
+    keyboard.add(KeyboardButton("⬅️ Главное меню"))
     return keyboard
 
 # User handlers
@@ -201,7 +209,7 @@ async def cmd_start(message: types.Message):
     await message.answer(
         f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
         f"Я бот для рассылки сообщений в группы.\n\n"
-        f"Выберите действие:",
+        f"Используйте кнопки ниже:",
         reply_markup=get_main_keyboard(message.from_user.id)
     )
 
@@ -219,87 +227,81 @@ async def cmd_admin(message: types.Message):
         reply_markup=get_admin_keyboard()
     )
 
-# ВСЕ Callback handlers
-@dp.callback_query_handler(lambda c: c.data == 'activate_license')
-async def process_activate_license(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)
-    await bot.send_message(callback_query.from_user.id, "🔑 Введите ваш лицензионный ключ:")
+# Обработчики текстовых команд (кнопки)
+@dp.message_handler(lambda message: message.text == "🔑 Активировать лицензию")
+async def activate_license(message: types.Message):
+    logger.info(f"Activate license from user {message.from_user.id}")
+    await message.answer("🔑 Введите ваш лицензионный ключ:")
     await UserStates.waiting_license.set()
 
-@dp.callback_query_handler(lambda c: c.data == 'connect_account')
-async def process_connect_account(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)
-    logger.info(f"Connect account from user {callback_query.from_user.id}")
+@dp.message_handler(lambda message: message.text == "📱 Подключить аккаунт")
+async def connect_account(message: types.Message):
+    logger.info(f"Connect account from user {message.from_user.id}")
     
-    if not is_valid_license(callback_query.from_user.id):
-        await bot.send_message(callback_query.from_user.id, "❌ У вас нет активной лицензии!")
+    if not is_valid_license(message.from_user.id):
+        await message.answer("❌ У вас нет активной лицензии!")
         return
     
-    await bot.send_message(
-        callback_query.from_user.id,
+    await message.answer(
         "📱 <b>Подключение аккаунта</b>\n\n"
         "Введите номер телефона в формате:\n"
         "<code>+79123456789</code>"
     )
     await UserStates.waiting_phone.set()
 
-@dp.callback_query_handler(lambda c: c.data == 'create_broadcast')
-async def process_create_broadcast(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)
-    logger.info(f"Create broadcast from user {callback_query.from_user.id}")
+@dp.message_handler(lambda message: message.text == "📨 Создать рассылку")
+async def create_broadcast(message: types.Message):
+    logger.info(f"Create broadcast from user {message.from_user.id}")
     
-    if not is_valid_license(callback_query.from_user.id):
-        await bot.send_message(callback_query.from_user.id, "❌ У вас нет активной лицензии!")
+    if not is_valid_license(message.from_user.id):
+        await message.answer("❌ У вас нет активной лицензии!")
         return
     
     db = SessionLocal()
     try:
-        user = db.query(User).filter_by(user_id=callback_query.from_user.id).first()
+        user = db.query(User).filter_by(user_id=message.from_user.id).first()
         if not user or not user.session_string:
-            await bot.send_message(callback_query.from_user.id, "❌ Сначала подключите аккаунт!")
+            await message.answer("❌ Сначала подключите аккаунт!")
             return
     finally:
         db.close()
     
-    await bot.send_message(
-        callback_query.from_user.id,
+    await message.answer(
         "📝 <b>Создание рассылки</b>\n\n"
         "Введите текст сообщения:"
     )
     await UserStates.waiting_message.set()
 
-@dp.callback_query_handler(lambda c: c.data == 'stop_broadcasts')
-async def process_stop_broadcasts(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)
-    logger.info(f"Stop broadcasts from user {callback_query.from_user.id}")
+@dp.message_handler(lambda message: message.text == "⏹ Остановить рассылки")
+async def stop_broadcasts(message: types.Message):
+    logger.info(f"Stop broadcasts from user {message.from_user.id}")
     
     db = SessionLocal()
     try:
         db.query(BroadcastTask).filter_by(
-            user_id=callback_query.from_user.id,
+            user_id=message.from_user.id,
             status='active'
         ).update({'status': 'paused'})
         db.commit()
     finally:
         db.close()
     
-    await bot.send_message(callback_query.from_user.id, "✅ Все рассылки остановлены.")
+    await message.answer("✅ Все рассылки остановлены.")
 
-@dp.callback_query_handler(lambda c: c.data == 'my_broadcasts')
-async def process_my_broadcasts(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)
-    logger.info(f"My broadcasts from user {callback_query.from_user.id}")
+@dp.message_handler(lambda message: message.text == "📊 Мои рассылки")
+async def my_broadcasts(message: types.Message):
+    logger.info(f"My broadcasts from user {message.from_user.id}")
     
     db = SessionLocal()
     try:
         tasks = db.query(BroadcastTask).filter_by(
-            user_id=callback_query.from_user.id
+            user_id=message.from_user.id
         ).order_by(BroadcastTask.created_at.desc()).limit(10).all()
     finally:
         db.close()
     
     if not tasks:
-        await bot.send_message(callback_query.from_user.id, "У вас нет рассылок.")
+        await message.answer("У вас нет рассылок.")
         return
     
     text = "📊 <b>Ваши рассылки:</b>\n\n"
@@ -309,20 +311,18 @@ async def process_my_broadcasts(callback_query: types.CallbackQuery):
         text += f"📝 {task.message_text[:50]}...\n"
         text += f"⏱ Интервал: {task.interval_minutes} мин\n\n"
     
-    await bot.send_message(callback_query.from_user.id, text)
+    await message.answer(text)
 
-# Admin callback handlers
-@dp.callback_query_handler(lambda c: c.data == 'admin_create_key')
-async def process_admin_create_key(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)
-    logger.info(f"Admin create key from user {callback_query.from_user.id}")
+# Админ кнопки
+@dp.message_handler(lambda message: message.text == "🔑 Создать ключ")
+async def admin_create_key(message: types.Message):
+    logger.info(f"Admin create key from user {message.from_user.id}")
     
-    if callback_query.from_user.id != ADMIN_ID:
-        await bot.send_message(callback_query.from_user.id, "⛔️ Нет доступа")
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔️ Нет доступа")
         return
     
-    await bot.send_message(
-        callback_query.from_user.id,
+    await message.answer(
         "🔑 <b>Создание ключа</b>\n\n"
         "Введите срок действия:\n"
         "• <code>30</code> - на месяц\n"
@@ -331,12 +331,12 @@ async def process_admin_create_key(callback_query: types.CallbackQuery):
     )
     await UserStates.admin_create_key.set()
 
-@dp.callback_query_handler(lambda c: c.data == 'admin_users')
-async def process_admin_users(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)
+@dp.message_handler(lambda message: message.text == "👥 Пользователи")
+async def admin_users(message: types.Message):
+    logger.info(f"Admin users from user {message.from_user.id}")
     
-    if callback_query.from_user.id != ADMIN_ID:
-        await bot.send_message(callback_query.from_user.id, "⛔️ Нет доступа")
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔️ Нет доступа")
         return
     
     db = SessionLocal()
@@ -344,7 +344,7 @@ async def process_admin_users(callback_query: types.CallbackQuery):
         users = db.query(User).all()
         
         if not users:
-            await bot.send_message(callback_query.from_user.id, "Нет пользователей.")
+            await message.answer("Нет пользователей.")
             return
         
         text = "👥 <b>Пользователи:</b>\n\n"
@@ -357,19 +357,19 @@ async def process_admin_users(callback_query: types.CallbackQuery):
                 text += f" (@{user.username})"
             text += f"\n🔑 Лицензия: {license_status}\n\n"
         
-        await bot.send_message(callback_query.from_user.id, text)
+        await message.answer(text)
     except Exception as e:
         logger.error(f"Error listing users: {e}")
-        await bot.send_message(callback_query.from_user.id, "❌ Ошибка.")
+        await message.answer("❌ Ошибка.")
     finally:
         db.close()
 
-@dp.callback_query_handler(lambda c: c.data == 'admin_stats')
-async def process_admin_stats(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)
+@dp.message_handler(lambda message: message.text == "📊 Статистика")
+async def admin_stats(message: types.Message):
+    logger.info(f"Admin stats from user {message.from_user.id}")
     
-    if callback_query.from_user.id != ADMIN_ID:
-        await bot.send_message(callback_query.from_user.id, "⛔️ Нет доступа")
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔️ Нет доступа")
         return
     
     db = SessionLocal()
@@ -378,8 +378,7 @@ async def process_admin_stats(callback_query: types.CallbackQuery):
         total_keys = db.query(LicenseKey).count()
         used_keys = db.query(LicenseKey).filter_by(is_used=True).count()
         
-        await bot.send_message(
-            callback_query.from_user.id,
+        await message.answer(
             f"📊 <b>Статистика:</b>\n\n"
             f"👥 Пользователей: <b>{total_users}</b>\n"
             f"🔑 Ключей: <b>{total_keys}</b>\n"
@@ -387,19 +386,27 @@ async def process_admin_stats(callback_query: types.CallbackQuery):
         )
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
-        await bot.send_message(callback_query.from_user.id, "❌ Ошибка.")
+        await message.answer("❌ Ошибка.")
     finally:
         db.close()
 
-@dp.callback_query_handler(lambda c: c.data == 'admin_block_user')
-async def process_admin_block_user(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)
+@dp.message_handler(lambda message: message.text == "🚫 Заблокировать")
+async def admin_block_user(message: types.Message):
+    logger.info(f"Admin block user from user {message.from_user.id}")
     
-    if callback_query.from_user.id != ADMIN_ID:
-        await bot.send_message(callback_query.from_user.id, "⛔️ Нет доступа")
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔️ Нет доступа")
         return
     
-    await bot.send_message(callback_query.from_user.id, "Введите ID пользователя для блокировки/разблокировки:")
+    await message.answer("Введите ID пользователя для блокировки/разблокировки:")
+    await UserStates.admin_block_user.set()
+
+@dp.message_handler(lambda message: message.text == "⬅️ Главное меню")
+async def back_to_main(message: types.Message):
+    if message.from_user.id == ADMIN_ID:
+        await message.answer("Вы в главном меню.", reply_markup=get_admin_keyboard())
+    else:
+        await message.answer("Вы в главном меню.", reply_markup=get_main_keyboard(message.from_user.id))
 
 # Message handlers for states
 @dp.message_handler(state=UserStates.waiting_license)
@@ -437,7 +444,8 @@ async def process_license_key(message: types.Message, state: FSMContext):
         
         await message.answer(
             f"✅ <b>Лицензия активирована!</b>\n\n"
-            f"📅 Действует до: <b>{expiry.strftime('%d.%m.%Y')}</b>"
+            f"📅 Действует до: <b>{expiry.strftime('%d.%m.%Y')}</b>",
+            reply_markup=get_main_keyboard(message.from_user.id)
         )
         await state.finish()
     except Exception as e:
@@ -553,7 +561,10 @@ async def process_code(message: types.Message, state: FSMContext):
         
         active_clients[message.from_user.id] = client
         
-        await message.answer("✅ <b>Аккаунт подключен!</b>")
+        await message.answer(
+            "✅ <b>Аккаунт подключен!</b>",
+            reply_markup=get_main_keyboard(message.from_user.id)
+        )
         await state.finish()
         
     except Exception as e:
@@ -602,12 +613,38 @@ async def process_interval(message: types.Message, state: FSMContext):
         await message.answer(
             f"✅ <b>Рассылка создана!</b>\n\n"
             f"📝 Сообщение: {message_text[:100]}\n"
-            f"⏱ Интервал: {interval} мин"
+            f"⏱ Интервал: {interval} мин",
+            reply_markup=get_main_keyboard(message.from_user.id)
         )
         await state.finish()
         
     except ValueError:
         await message.answer("❌ Введите число.")
+
+@dp.message_handler(state=UserStates.admin_block_user)
+async def process_admin_block_user_id(message: types.Message, state: FSMContext):
+    try:
+        user_id = int(message.text)
+        
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(user_id=user_id).first()
+            if not user:
+                await message.answer("❌ Пользователь не найден.")
+                await state.finish()
+                return
+            
+            user.is_blocked = not user.is_blocked
+            db.commit()
+            status = "заблокирован" if user.is_blocked else "разблокирован"
+            
+            await message.answer(f"✅ Пользователь {user_id} {status}.")
+            await state.finish()
+        finally:
+            db.close()
+        
+    except ValueError:
+        await message.answer("❌ Введите корректный ID.")
 
 # Startup
 async def on_startup(dp):
