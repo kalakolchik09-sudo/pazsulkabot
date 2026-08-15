@@ -188,6 +188,7 @@ def get_main_keyboard(user_id: int):
             KeyboardButton("⏹ Остановить рассылки"),
             KeyboardButton("📊 Мои рассылки")
         )
+        keyboard.add(KeyboardButton("👤 Профиль"))
     else:
         keyboard.add(KeyboardButton("🔑 Активировать лицензию"))
     return keyboard
@@ -202,6 +203,7 @@ def get_admin_keyboard():
         KeyboardButton("📊 Статистика"),
         KeyboardButton("🚫 Заблокировать")
     )
+    keyboard.add(KeyboardButton("👤 Профиль"))
     return keyboard
 
 # Функция получения групп
@@ -253,7 +255,6 @@ async def start_broadcast(user_id: int, task_id: int):
         await client.start()
         logger.info(f"Broadcast client started for user {user_id}")
         
-        # Получаем группы
         groups = await get_user_groups(client)
         
         if not groups:
@@ -264,7 +265,6 @@ async def start_broadcast(user_id: int, task_id: int):
             )
             return
         
-        # Обновляем количество групп
         db = SessionLocal()
         try:
             db.query(BroadcastTask).filter_by(id=task_id).update({'groups_count': len(groups)})
@@ -272,7 +272,6 @@ async def start_broadcast(user_id: int, task_id: int):
         finally:
             db.close()
         
-        # Отправляем стартовое сообщение
         status_message = await bot.send_message(
             user_id,
             f"🚀 <b>Рассылка запущена!</b>\n\n"
@@ -284,9 +283,8 @@ async def start_broadcast(user_id: int, task_id: int):
         
         cycle = 0
         total_sent = 0
-        last_groups = []  # Последние 5 групп
+        last_groups = []
         
-        # Бесконечный цикл рассылки
         while True:
             db = SessionLocal()
             try:
@@ -300,7 +298,6 @@ async def start_broadcast(user_id: int, task_id: int):
             cycle += 1
             sent_in_cycle = 0
             
-            # Обновляем сообщение о начале цикла
             try:
                 await status_message.edit_text(
                     f"🔄 <b>Цикл {cycle}</b>\n\n"
@@ -312,7 +309,6 @@ async def start_broadcast(user_id: int, task_id: int):
             except:
                 pass
             
-            # Отправляем во все группы с паузой 2 секунды
             for i, group in enumerate(groups, 1):
                 db = SessionLocal()
                 try:
@@ -328,12 +324,10 @@ async def start_broadcast(user_id: int, task_id: int):
                     sent_in_cycle += 1
                     total_sent += 1
                     
-                    # Добавляем группу в последние 5
                     last_groups.append(group['title'])
                     if len(last_groups) > 5:
                         last_groups.pop(0)
                     
-                    # Обновляем счетчики в БД
                     db = SessionLocal()
                     try:
                         db.query(BroadcastTask).filter_by(id=task_id).update({
@@ -344,15 +338,13 @@ async def start_broadcast(user_id: int, task_id: int):
                     finally:
                         db.close()
                     
-                    # Формируем текст последних 5 групп
                     last_groups_text = "\n".join([f"• {g}" for g in last_groups[-5:]])
                     
-                    # Обновляем ОДНО сообщение
                     try:
                         await status_message.edit_text(
                             f"🔄 <b>Цикл {cycle}</b>\n\n"
                             f"📨 Отправлено: <b>{sent_in_cycle}/{len(groups)}</b>\n"
-                            f"📊 Всего за все время: <b>{total_sent}</b>\n\n"
+                            f"📊 Всего: <b>{total_sent}</b>\n\n"
                             f"<b>Последние группы:</b>\n"
                             f"{last_groups_text}\n\n"
                             f"⏳ Отправляю..."
@@ -360,7 +352,6 @@ async def start_broadcast(user_id: int, task_id: int):
                     except:
                         pass
                     
-                    # Пауза 2 секунды
                     if i < len(groups):
                         await asyncio.sleep(2)
                     
@@ -381,7 +372,6 @@ async def start_broadcast(user_id: int, task_id: int):
                     logger.error(f"Error sending to {group['title']}: {e}")
                     continue
             
-            # Цикл завершен
             if sent_in_cycle > 0:
                 last_groups_text = "\n".join([f"• {g}" for g in last_groups[-5:]])
                 
@@ -397,11 +387,9 @@ async def start_broadcast(user_id: int, task_id: int):
                 except:
                     pass
             
-            # Ждем интервал
             interval_seconds = task.interval_minutes * 60
             await asyncio.sleep(interval_seconds)
         
-        # Задача остановлена
         db = SessionLocal()
         try:
             db.query(BroadcastTask).filter_by(id=task_id).update({'status': 'completed'})
@@ -440,6 +428,73 @@ async def cmd_admin(message: types.Message):
         await message.answer("⛔️ Нет доступа")
         return
     await message.answer("🔐 Админ-панель:", reply_markup=get_admin_keyboard())
+
+# Кнопка Профиль
+@dp.message_handler(lambda message: message.text == "👤 Профиль")
+async def show_profile(message: types.Message):
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(user_id=message.from_user.id).first()
+        
+        if not user:
+            await message.answer("❌ Пользователь не найден. Нажмите /start")
+            return
+        
+        # Информация о подписке
+        if user.license_expiry:
+            if user.license_expiry > datetime.utcnow():
+                days_left = (user.license_expiry - datetime.utcnow()).days
+                license_status = f"✅ <b>Активна</b>\n📅 До: <b>{user.license_expiry.strftime('%d.%m.%Y')}</b>\n⏳ Осталось: <b>{days_left} дней</b>"
+            else:
+                license_status = f"❌ <b>Истекла</b>\n📅 Была до: <b>{user.license_expiry.strftime('%d.%m.%Y')}</b>"
+        else:
+            license_status = "❌ <b>Не активирована</b>"
+        
+        # Информация об аккаунтах
+        if user.session_string:
+            accounts_count = 1
+            accounts_info = f"✅ <b>1 аккаунт подключен</b>\n📱 Номер: <code>{user.phone_number or 'Неизвестно'}</code>"
+        else:
+            accounts_count = 0
+            accounts_info = "❌ <b>Нет подключенных аккаунтов</b>"
+        
+        # Статистика рассылок
+        total_broadcasts = db.query(BroadcastTask).filter_by(user_id=message.from_user.id).count()
+        active_broadcasts = db.query(BroadcastTask).filter_by(user_id=message.from_user.id, status='active').count()
+        
+        profile_text = f"""
+👤 <b>Ваш профиль</b>
+
+🆔 ID: <code>{user.user_id}</code>
+👤 Имя: <b>{user.first_name or 'Не указано'}</b>
+{f"🔗 Username: @{user.username}" if user.username else ""}
+
+━━━━━━━━━━━━━━
+
+💳 <b>Подписка:</b>
+{license_status}
+
+━━━━━━━━━━━━━━
+
+📱 <b>Аккаунты:</b>
+{accounts_info}
+
+━━━━━━━━━━━━━━
+
+📊 <b>Статистика рассылок:</b>
+📨 Всего: <b>{total_broadcasts}</b>
+🔄 Активных: <b>{active_broadcasts}</b>
+
+━━━━━━━━━━━━━━
+
+📅 <b>Дата регистрации:</b>
+{user.created_at.strftime('%d.%m.%Y')}
+"""
+        
+        await message.answer(profile_text, reply_markup=get_main_keyboard(message.from_user.id))
+        
+    finally:
+        db.close()
 
 # Кнопки
 @dp.message_handler(lambda message: message.text == "🔑 Активировать лицензию")
