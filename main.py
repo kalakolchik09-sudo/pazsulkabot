@@ -15,7 +15,7 @@ from pyrogram import Client
 from pyrogram.errors import FloodWait
 
 # Database imports
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text, text
+from sqlalchemy import create_engine, Column, BigInteger, String, DateTime, Boolean, Text, text
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -34,22 +34,11 @@ if not BOT_TOKEN:
     logger.error("❌ BOT_TOKEN не указан!")
     raise ValueError("BOT_TOKEN is required")
 
-if API_ID == 0:
-    logger.error("❌ API_ID не указан!")
-    raise ValueError("API_ID is required")
-
-if not API_HASH:
-    logger.error("❌ API_HASH не указан!")
-    raise ValueError("API_HASH is required")
-
 logger.info(f"✅ Bot token: {BOT_TOKEN[:10]}...")
-logger.info(f"✅ API_ID: {API_ID}")
 logger.info(f"✅ Admin ID: {ADMIN_ID}")
 
 # Database URL
 def get_database_url():
-    """Get database URL from environment"""
-    
     public_url = os.getenv('DATABASE_PUBLIC_URL', '')
     if public_url:
         if public_url.startswith('postgres://'):
@@ -84,11 +73,11 @@ except Exception as e:
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-# Models
+# Models - используем BigInteger для user_id
 class User(Base):
     __tablename__ = 'users'
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, unique=True, nullable=False)
+    user_id = Column(BigInteger, unique=True, nullable=False)  # Изменено на BigInteger
     username = Column(String, nullable=True)
     first_name = Column(String, nullable=True)
     license_key = Column(String, unique=True, nullable=True)
@@ -104,19 +93,21 @@ class LicenseKey(Base):
     key = Column(String, unique=True, nullable=False)
     duration_days = Column(Integer, default=30)
     is_used = Column(Boolean, default=False)
-    used_by = Column(Integer, nullable=True)
+    used_by = Column(BigInteger, nullable=True)  # Изменено на BigInteger
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class BroadcastTask(Base):
     __tablename__ = 'broadcast_tasks'
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, nullable=False)
+    user_id = Column(BigInteger, nullable=False)  # Изменено на BigInteger
     message_text = Column(Text, nullable=False)
     interval_minutes = Column(Integer, default=30)
     status = Column(String, default='active')
     groups_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+# Удаляем старые таблицы и создаем новые
+Base.metadata.drop_all(engine)
 Base.metadata.create_all(engine)
 logger.info("✅ Tables created")
 
@@ -127,6 +118,7 @@ class UserStates(StatesGroup):
     waiting_message = State()
     waiting_interval = State()
     waiting_license = State()
+    admin_create_key = State()  # Добавлено состояние для админа
 
 # Initialize bot
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
@@ -211,9 +203,6 @@ async def cmd_start(message: types.Message):
     await message.answer(
         f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
         f"Я бот для рассылки сообщений в группы.\n\n"
-        f"<b>Доступные команды:</b>\n"
-        f"/start - Главное меню\n"
-        f"/admin - Админ-панель (только для админа)\n\n"
         f"Выберите действие:",
         reply_markup=get_main_keyboard(message.from_user.id)
     )
@@ -221,7 +210,6 @@ async def cmd_start(message: types.Message):
 @dp.message_handler(commands=['admin'])
 async def cmd_admin(message: types.Message):
     logger.info(f"Admin command from user {message.from_user.id}")
-    logger.info(f"Admin ID from env: {ADMIN_ID}")
     
     if message.from_user.id != ADMIN_ID:
         await message.answer("⛔️ У вас нет доступа к админ-панели.")
@@ -235,7 +223,6 @@ async def cmd_admin(message: types.Message):
 
 @dp.callback_query_handler(lambda c: c.data == 'activate_license')
 async def process_activate_license(callback_query: types.CallbackQuery):
-    logger.info(f"Activate license from user {callback_query.from_user.id}")
     await bot.answer_callback_query(callback_query.id)
     await bot.send_message(callback_query.from_user.id, "🔑 Введите ваш лицензионный ключ:")
     await UserStates.waiting_license.set()
@@ -243,7 +230,6 @@ async def process_activate_license(callback_query: types.CallbackQuery):
 @dp.message_handler(state=UserStates.waiting_license)
 async def process_license_key(message: types.Message, state: FSMContext):
     license_key = message.text.strip()
-    logger.info(f"License key entered: {license_key}")
     
     db = SessionLocal()
     try:
@@ -302,10 +288,12 @@ async def process_admin_create_key(callback_query: types.CallbackQuery):
         "• <code>365</code> - на год\n"
         "• <code>-1</code> - навсегда"
     )
-    await dp.current_state(user=callback_query.from_user.id).set_state('admin_create_key')
+    await UserStates.admin_create_key.set()  # Используем состояние из UserStates
 
-@dp.message_handler(lambda message: message.from_user.id == ADMIN_ID and dp.current_state(user=message.from_user.id).get_state() == 'admin_create_key')
+@dp.message_handler(state=UserStates.admin_create_key)
 async def process_admin_key_duration(message: types.Message, state: FSMContext):
+    logger.info(f"Processing key duration: {message.text}")
+    
     try:
         duration = int(message.text)
         key = generate_license_key(duration)
@@ -341,6 +329,66 @@ async def process_admin_key_duration(message: types.Message, state: FSMContext):
         logger.error(f"Error: {e}")
         await message.answer("❌ Произошла ошибка.")
         await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data == 'admin_users')
+async def process_admin_users(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id != ADMIN_ID:
+        await bot.answer_callback_query(callback_query.id, "⛔️ Нет доступа", show_alert=True)
+        return
+    
+    await bot.answer_callback_query(callback_query.id)
+    
+    db = SessionLocal()
+    try:
+        users = db.query(User).all()
+        
+        if not users:
+            await bot.send_message(callback_query.from_user.id, "Нет пользователей.")
+            return
+        
+        text = "👥 <b>Пользователи:</b>\n\n"
+        for user in users:
+            status = "🚫" if user.is_blocked else "✅"
+            license_status = "✅" if user.license_expiry and user.license_expiry > datetime.utcnow() else "❌"
+            text += f"{status} ID: <code>{user.user_id}</code>\n"
+            text += f"👤 {user.first_name or 'Нет имени'}"
+            if user.username:
+                text += f" (@{user.username})"
+            text += f"\n🔑 Лицензия: {license_status}\n\n"
+        
+        await bot.send_message(callback_query.from_user.id, text)
+    except Exception as e:
+        logger.error(f"Error listing users: {e}")
+        await bot.send_message(callback_query.from_user.id, "❌ Ошибка.")
+    finally:
+        db.close()
+
+@dp.callback_query_handler(lambda c: c.data == 'admin_stats')
+async def process_admin_stats(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id != ADMIN_ID:
+        await bot.answer_callback_query(callback_query.id, "⛔️ Нет доступа", show_alert=True)
+        return
+    
+    await bot.answer_callback_query(callback_query.id)
+    
+    db = SessionLocal()
+    try:
+        total_users = db.query(User).count()
+        total_keys = db.query(LicenseKey).count()
+        used_keys = db.query(LicenseKey).filter_by(is_used=True).count()
+        
+        await bot.send_message(
+            callback_query.from_user.id,
+            f"📊 <b>Статистика:</b>\n\n"
+            f"👥 Пользователей: <b>{total_users}</b>\n"
+            f"🔑 Ключей: <b>{total_keys}</b>\n"
+            f"📤 Использовано: <b>{used_keys}</b>"
+        )
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        await bot.send_message(callback_query.from_user.id, "❌ Ошибка.")
+    finally:
+        db.close()
 
 # Startup
 async def on_startup(dp):
