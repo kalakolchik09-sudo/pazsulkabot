@@ -105,13 +105,9 @@ class BroadcastTask(Base):
     groups_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# Пересоздаем таблицы
-try:
-    Base.metadata.drop_all(engine)
-    Base.metadata.create_all(engine)
-    logger.info("✅ Tables created")
-except Exception as e:
-    logger.error(f"Error creating tables: {e}")
+# Create tables (без drop_all чтобы не терять данные)
+Base.metadata.create_all(engine)
+logger.info("✅ Tables ready")
 
 # States
 class UserStates(StatesGroup):
@@ -223,16 +219,107 @@ async def cmd_admin(message: types.Message):
         reply_markup=get_admin_keyboard()
     )
 
-# ВАЖНО: Все callback handlers должны сначала вызывать answer_callback_query
+# Callback handlers
 @dp.callback_query_handler(lambda c: c.data == 'activate_license')
 async def process_activate_license(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)  # Обязательно!
+    await bot.answer_callback_query(callback_query.id)
     await bot.send_message(callback_query.from_user.id, "🔑 Введите ваш лицензионный ключ:")
     await UserStates.waiting_license.set()
 
+@dp.callback_query_handler(lambda c: c.data == 'admin_create_key')
+async def process_admin_create_key(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    logger.info(f"Admin create key from user {callback_query.from_user.id}")
+    
+    if callback_query.from_user.id != ADMIN_ID:
+        await bot.send_message(callback_query.from_user.id, "⛔️ Нет доступа")
+        return
+    
+    await bot.send_message(
+        callback_query.from_user.id,
+        "🔑 <b>Создание ключа</b>\n\n"
+        "Введите срок действия:\n"
+        "• <code>30</code> - на месяц\n"
+        "• <code>365</code> - на год\n"
+        "• <code>-1</code> - навсегда"
+    )
+    await UserStates.admin_create_key.set()
+
+@dp.callback_query_handler(lambda c: c.data == 'admin_users')
+async def process_admin_users(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    
+    if callback_query.from_user.id != ADMIN_ID:
+        await bot.send_message(callback_query.from_user.id, "⛔️ Нет доступа")
+        return
+    
+    db = SessionLocal()
+    try:
+        users = db.query(User).all()
+        
+        if not users:
+            await bot.send_message(callback_query.from_user.id, "Нет пользователей.")
+            return
+        
+        text = "👥 <b>Пользователи:</b>\n\n"
+        for user in users:
+            status = "🚫" if user.is_blocked else "✅"
+            license_status = "✅" if user.license_expiry and user.license_expiry > datetime.utcnow() else "❌"
+            text += f"{status} ID: <code>{user.user_id}</code>\n"
+            text += f"👤 {user.first_name or 'Нет имени'}"
+            if user.username:
+                text += f" (@{user.username})"
+            text += f"\n🔑 Лицензия: {license_status}\n\n"
+        
+        await bot.send_message(callback_query.from_user.id, text)
+    except Exception as e:
+        logger.error(f"Error listing users: {e}")
+        await bot.send_message(callback_query.from_user.id, "❌ Ошибка.")
+    finally:
+        db.close()
+
+@dp.callback_query_handler(lambda c: c.data == 'admin_stats')
+async def process_admin_stats(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    
+    if callback_query.from_user.id != ADMIN_ID:
+        await bot.send_message(callback_query.from_user.id, "⛔️ Нет доступа")
+        return
+    
+    db = SessionLocal()
+    try:
+        total_users = db.query(User).count()
+        total_keys = db.query(LicenseKey).count()
+        used_keys = db.query(LicenseKey).filter_by(is_used=True).count()
+        
+        await bot.send_message(
+            callback_query.from_user.id,
+            f"📊 <b>Статистика:</b>\n\n"
+            f"👥 Пользователей: <b>{total_users}</b>\n"
+            f"🔑 Ключей: <b>{total_keys}</b>\n"
+            f"📤 Использовано: <b>{used_keys}</b>"
+        )
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        await bot.send_message(callback_query.from_user.id, "❌ Ошибка.")
+    finally:
+        db.close()
+
+@dp.callback_query_handler(lambda c: c.data == 'admin_block_user')
+async def process_admin_block_user(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    
+    if callback_query.from_user.id != ADMIN_ID:
+        await bot.send_message(callback_query.from_user.id, "⛔️ Нет доступа")
+        return
+    
+    await bot.send_message(callback_query.from_user.id, "Введите ID пользователя для блокировки/разблокировки:")
+
+# Message handlers for states
 @dp.message_handler(state=UserStates.waiting_license)
 async def process_license_key(message: types.Message, state: FSMContext):
     license_key = message.text.strip()
+    logger.info(f"Processing license key: {license_key}")
     
     db = SessionLocal()
     try:
@@ -274,25 +361,6 @@ async def process_license_key(message: types.Message, state: FSMContext):
     finally:
         db.close()
 
-@dp.callback_query_handler(lambda c: c.data == 'admin_create_key')
-async def process_admin_create_key(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)  # Обязательно!
-    logger.info(f"Admin create key from user {callback_query.from_user.id}")
-    
-    if callback_query.from_user.id != ADMIN_ID:
-        await bot.send_message(callback_query.from_user.id, "⛔️ Нет доступа")
-        return
-    
-    await bot.send_message(
-        callback_query.from_user.id,
-        "🔑 <b>Создание ключа</b>\n\n"
-        "Введите срок действия:\n"
-        "• <code>30</code> - на месяц\n"
-        "• <code>365</code> - на год\n"
-        "• <code>-1</code> - навсегда"
-    )
-    await UserStates.admin_create_key.set()
-
 @dp.message_handler(state=UserStates.admin_create_key)
 async def process_admin_key_duration(message: types.Message, state: FSMContext):
     logger.info(f"Processing key duration: {message.text}")
@@ -332,76 +400,6 @@ async def process_admin_key_duration(message: types.Message, state: FSMContext):
         logger.error(f"Error: {e}")
         await message.answer("❌ Произошла ошибка.")
         await state.finish()
-
-@dp.callback_query_handler(lambda c: c.data == 'admin_users')
-async def process_admin_users(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)  # Обязательно!
-    
-    if callback_query.from_user.id != ADMIN_ID:
-        await bot.send_message(callback_query.from_user.id, "⛔️ Нет доступа")
-        return
-    
-    db = SessionLocal()
-    try:
-        users = db.query(User).all()
-        
-        if not users:
-            await bot.send_message(callback_query.from_user.id, "Нет пользователей.")
-            return
-        
-        text = "👥 <b>Пользователи:</b>\n\n"
-        for user in users:
-            status = "🚫" if user.is_blocked else "✅"
-            license_status = "✅" if user.license_expiry and user.license_expiry > datetime.utcnow() else "❌"
-            text += f"{status} ID: <code>{user.user_id}</code>\n"
-            text += f"👤 {user.first_name or 'Нет имени'}"
-            if user.username:
-                text += f" (@{user.username})"
-            text += f"\n🔑 Лицензия: {license_status}\n\n"
-        
-        await bot.send_message(callback_query.from_user.id, text)
-    except Exception as e:
-        logger.error(f"Error listing users: {e}")
-        await bot.send_message(callback_query.from_user.id, "❌ Ошибка.")
-    finally:
-        db.close()
-
-@dp.callback_query_handler(lambda c: c.data == 'admin_stats')
-async def process_admin_stats(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)  # Обязательно!
-    
-    if callback_query.from_user.id != ADMIN_ID:
-        await bot.send_message(callback_query.from_user.id, "⛔️ Нет доступа")
-        return
-    
-    db = SessionLocal()
-    try:
-        total_users = db.query(User).count()
-        total_keys = db.query(LicenseKey).count()
-        used_keys = db.query(LicenseKey).filter_by(is_used=True).count()
-        
-        await bot.send_message(
-            callback_query.from_user.id,
-            f"📊 <b>Статистика:</b>\n\n"
-            f"👥 Пользователей: <b>{total_users}</b>\n"
-            f"🔑 Ключей: <b>{total_keys}</b>\n"
-            f"📤 Использовано: <b>{used_keys}</b>"
-        )
-    except Exception as e:
-        logger.error(f"Error getting stats: {e}")
-        await bot.send_message(callback_query.from_user.id, "❌ Ошибка.")
-    finally:
-        db.close()
-
-@dp.callback_query_handler(lambda c: c.data == 'admin_block_user')
-async def process_admin_block_user(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)  # Обязательно!
-    
-    if callback_query.from_user.id != ADMIN_ID:
-        await bot.send_message(callback_query.from_user.id, "⛔️ Нет доступа")
-        return
-    
-    await bot.send_message(callback_query.from_user.id, "Введите ID пользователя для блокировки/разблокировки:")
 
 # Startup
 async def on_startup(dp):
