@@ -352,8 +352,9 @@ async def start_broadcast(user_id: int, task_id: int):
                     except:
                         pass
                     
+                    # Пауза 1 секунда между группами
                     if i < len(groups):
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(1)
                     
                 except FloodWait as e:
                     logger.warning(f"FloodWait: {e.value} seconds")
@@ -365,7 +366,7 @@ async def start_broadcast(user_id: int, task_id: int):
                         last_groups.append(group['title'])
                         if len(last_groups) > 5:
                             last_groups.pop(0)
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(1)
                     except:
                         continue
                 except Exception as e:
@@ -440,7 +441,6 @@ async def show_profile(message: types.Message):
             await message.answer("❌ Пользователь не найден. Нажмите /start")
             return
         
-        # Информация о подписке
         if user.license_expiry:
             if user.license_expiry > datetime.utcnow():
                 days_left = (user.license_expiry - datetime.utcnow()).days
@@ -450,15 +450,11 @@ async def show_profile(message: types.Message):
         else:
             license_status = "❌ <b>Не активирована</b>"
         
-        # Информация об аккаунтах
         if user.session_string:
-            accounts_count = 1
             accounts_info = f"✅ <b>1 аккаунт подключен</b>\n📱 Номер: <code>{user.phone_number or 'Неизвестно'}</code>"
         else:
-            accounts_count = 0
             accounts_info = "❌ <b>Нет подключенных аккаунтов</b>"
         
-        # Статистика рассылок
         total_broadcasts = db.query(BroadcastTask).filter_by(user_id=message.from_user.id).count()
         active_broadcasts = db.query(BroadcastTask).filter_by(user_id=message.from_user.id, status='active').count()
         
