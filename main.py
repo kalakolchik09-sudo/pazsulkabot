@@ -14,7 +14,7 @@ from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 
-# Database imports - добавлены все необходимые типы
+# Database imports
 from sqlalchemy import create_engine, Column, Integer, BigInteger, String, DateTime, Boolean, Text, text
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -29,7 +29,6 @@ API_HASH = os.getenv('API_HASH', '')
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 
-# Проверка обязательных переменных
 if not BOT_TOKEN:
     logger.error("❌ BOT_TOKEN не указан!")
     raise ValueError("BOT_TOKEN is required")
@@ -73,7 +72,7 @@ except Exception as e:
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-# Models - все типы правильно импортированы
+# Models
 class User(Base):
     __tablename__ = 'users'
     id = Column(Integer, primary_key=True)
@@ -224,9 +223,10 @@ async def cmd_admin(message: types.Message):
         reply_markup=get_admin_keyboard()
     )
 
+# ВАЖНО: Все callback handlers должны сначала вызывать answer_callback_query
 @dp.callback_query_handler(lambda c: c.data == 'activate_license')
 async def process_activate_license(callback_query: types.CallbackQuery):
-    await bot.answer_callback_query(callback_query.id)
+    await bot.answer_callback_query(callback_query.id)  # Обязательно!
     await bot.send_message(callback_query.from_user.id, "🔑 Введите ваш лицензионный ключ:")
     await UserStates.waiting_license.set()
 
@@ -276,13 +276,13 @@ async def process_license_key(message: types.Message, state: FSMContext):
 
 @dp.callback_query_handler(lambda c: c.data == 'admin_create_key')
 async def process_admin_create_key(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)  # Обязательно!
     logger.info(f"Admin create key from user {callback_query.from_user.id}")
     
     if callback_query.from_user.id != ADMIN_ID:
-        await bot.answer_callback_query(callback_query.id, "⛔️ Нет доступа", show_alert=True)
+        await bot.send_message(callback_query.from_user.id, "⛔️ Нет доступа")
         return
     
-    await bot.answer_callback_query(callback_query.id)
     await bot.send_message(
         callback_query.from_user.id,
         "🔑 <b>Создание ключа</b>\n\n"
@@ -335,11 +335,11 @@ async def process_admin_key_duration(message: types.Message, state: FSMContext):
 
 @dp.callback_query_handler(lambda c: c.data == 'admin_users')
 async def process_admin_users(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id != ADMIN_ID:
-        await bot.answer_callback_query(callback_query.id, "⛔️ Нет доступа", show_alert=True)
-        return
+    await bot.answer_callback_query(callback_query.id)  # Обязательно!
     
-    await bot.answer_callback_query(callback_query.id)
+    if callback_query.from_user.id != ADMIN_ID:
+        await bot.send_message(callback_query.from_user.id, "⛔️ Нет доступа")
+        return
     
     db = SessionLocal()
     try:
@@ -368,11 +368,11 @@ async def process_admin_users(callback_query: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == 'admin_stats')
 async def process_admin_stats(callback_query: types.CallbackQuery):
-    if callback_query.from_user.id != ADMIN_ID:
-        await bot.answer_callback_query(callback_query.id, "⛔️ Нет доступа", show_alert=True)
-        return
+    await bot.answer_callback_query(callback_query.id)  # Обязательно!
     
-    await bot.answer_callback_query(callback_query.id)
+    if callback_query.from_user.id != ADMIN_ID:
+        await bot.send_message(callback_query.from_user.id, "⛔️ Нет доступа")
+        return
     
     db = SessionLocal()
     try:
@@ -392,6 +392,16 @@ async def process_admin_stats(callback_query: types.CallbackQuery):
         await bot.send_message(callback_query.from_user.id, "❌ Ошибка.")
     finally:
         db.close()
+
+@dp.callback_query_handler(lambda c: c.data == 'admin_block_user')
+async def process_admin_block_user(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)  # Обязательно!
+    
+    if callback_query.from_user.id != ADMIN_ID:
+        await bot.send_message(callback_query.from_user.id, "⛔️ Нет доступа")
+        return
+    
+    await bot.send_message(callback_query.from_user.id, "Введите ID пользователя для блокировки/разблокировки:")
 
 # Startup
 async def on_startup(dp):
