@@ -1,7 +1,6 @@
 import os
 import asyncio
 import logging
-import random
 from datetime import datetime, timedelta
 import secrets
 
@@ -206,31 +205,23 @@ def get_admin_keyboard():
     return keyboard
 
 # Функция получения групп
-async def get_user_groups(client: Client, user_id: int):
+async def get_user_groups(client: Client):
     """Получает все группы пользователя"""
     groups = []
     
     try:
-        # Получаем все диалоги
         dialogs = []
         async for dialog in client.get_dialogs(limit=None):
             dialogs.append(dialog)
         
-        logger.info(f"Total dialogs found: {len(dialogs)}")
-        
-        # Фильтруем только группы
         for dialog in dialogs:
             chat = dialog.chat
-            logger.info(f"Dialog: {chat.id} - {chat.type} - {chat.title if hasattr(chat, 'title') else 'No title'}")
-            
-            # Проверяем тип чата
             if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
                 groups.append({
                     'id': chat.id,
                     'title': chat.title or 'Без названия'
                 })
-        
-        logger.info(f"Groups found: {len(groups)}")
+                logger.info(f"Found group: {chat.title}")
         
     except Exception as e:
         logger.error(f"Error getting groups: {e}")
@@ -239,7 +230,7 @@ async def get_user_groups(client: Client, user_id: int):
 
 # Функция рассылки
 async def start_broadcast(user_id: int, task_id: int):
-    """Бесконечная рассылка с случайными интервалами"""
+    """Бесконечная рассылка с обновлением одного сообщения"""
     db = SessionLocal()
     try:
         task = db.query(BroadcastTask).filter_by(id=task_id).first()
@@ -263,41 +254,37 @@ async def start_broadcast(user_id: int, task_id: int):
         logger.info(f"Broadcast client started for user {user_id}")
         
         # Получаем группы
-        dialogs = await get_user_groups(client, user_id)
+        groups = await get_user_groups(client)
         
-        if not dialogs:
+        if not groups:
             await bot.send_message(
                 user_id,
                 "❌ <b>Не найдено групп!</b>\n\n"
-                "Возможные причины:\n"
-                "1. Аккаунт не состоит в группах\n"
-                "2. Сессия устарела\n\n"
-                "Попробуйте:\n"
-                "• Переподключить аккаунт\n"
-                "• Проверить, что аккаунт в группах"
+                "Проверьте, что аккаунт состоит в группах."
             )
             return
         
         # Обновляем количество групп
         db = SessionLocal()
         try:
-            db.query(BroadcastTask).filter_by(id=task_id).update({'groups_count': len(dialogs)})
+            db.query(BroadcastTask).filter_by(id=task_id).update({'groups_count': len(groups)})
             db.commit()
         finally:
             db.close()
         
-        await bot.send_message(
+        # Отправляем стартовое сообщение
+        status_message = await bot.send_message(
             user_id,
             f"🚀 <b>Рассылка запущена!</b>\n\n"
-            f"👥 Найдено групп: <b>{len(dialogs)}</b>\n"
-            f"📝 Сообщение: {task.message_text[:100]}\n"
-            f"⏱ Базовый интервал: {task.interval_minutes} мин\n"
-            f"🎲 Случайное отклонение: ±5 мин\n\n"
-            f"Начинаю отправку..."
+            f"👥 Групп: <b>{len(groups)}</b>\n"
+            f"📝 Сообщение: {task.message_text[:50]}\n"
+            f"⏱ Интервал: {task.interval_minutes} мин\n\n"
+            f"⏳ Начинаю..."
         )
         
         cycle = 0
         total_sent = 0
+        last_groups = []  # Последние 5 групп
         
         # Бесконечный цикл рассылки
         while True:
@@ -313,9 +300,20 @@ async def start_broadcast(user_id: int, task_id: int):
             cycle += 1
             sent_in_cycle = 0
             
-            logger.info(f"Starting cycle {cycle} for task {task_id}")
+            # Обновляем сообщение о начале цикла
+            try:
+                await status_message.edit_text(
+                    f"🔄 <b>Цикл {cycle}</b>\n\n"
+                    f"👥 Групп: {len(groups)}\n"
+                    f"📨 Отправлено: 0/{len(groups)}\n"
+                    f"📊 Всего: {total_sent}\n\n"
+                    f"⏳ Отправляю..."
+                )
+            except:
+                pass
             
-            for group in dialogs:
+            # Отправляем во все группы с паузой 2 секунды
+            for i, group in enumerate(groups, 1):
                 db = SessionLocal()
                 try:
                     current_task = db.query(BroadcastTask).filter_by(id=task_id).first()
@@ -330,8 +328,12 @@ async def start_broadcast(user_id: int, task_id: int):
                     sent_in_cycle += 1
                     total_sent += 1
                     
-                    logger.info(f"Cycle {cycle}: Sent to {group['title']} ({sent_in_cycle}/{len(dialogs)})")
+                    # Добавляем группу в последние 5
+                    last_groups.append(group['title'])
+                    if len(last_groups) > 5:
+                        last_groups.pop(0)
                     
+                    # Обновляем счетчики в БД
                     db = SessionLocal()
                     try:
                         db.query(BroadcastTask).filter_by(id=task_id).update({
@@ -342,39 +344,64 @@ async def start_broadcast(user_id: int, task_id: int):
                     finally:
                         db.close()
                     
-                    await bot.send_message(
-                        user_id,
-                        f"📨 <b>Цикл {cycle}</b>\n"
-                        f"👥 Группа: {group['title']}\n"
-                        f"📊 Прогресс: {sent_in_cycle}/{len(dialogs)}\n"
-                        f"✅ Всего: {total_sent}"
-                    )
+                    # Формируем текст последних 5 групп
+                    last_groups_text = "\n".join([f"• {g}" for g in last_groups[-5:]])
                     
-                    group_pause = random.randint(30, 60)
-                    await asyncio.sleep(group_pause)
+                    # Обновляем ОДНО сообщение
+                    try:
+                        await status_message.edit_text(
+                            f"🔄 <b>Цикл {cycle}</b>\n\n"
+                            f"📨 Отправлено: <b>{sent_in_cycle}/{len(groups)}</b>\n"
+                            f"📊 Всего за все время: <b>{total_sent}</b>\n\n"
+                            f"<b>Последние группы:</b>\n"
+                            f"{last_groups_text}\n\n"
+                            f"⏳ Отправляю..."
+                        )
+                    except:
+                        pass
+                    
+                    # Пауза 2 секунды
+                    if i < len(groups):
+                        await asyncio.sleep(2)
                     
                 except FloodWait as e:
                     logger.warning(f"FloodWait: {e.value} seconds")
-                    await bot.send_message(user_id, f"⚠️ Пауза {e.value} сек...")
                     await asyncio.sleep(e.value)
+                    try:
+                        await client.send_message(group['id'], task.message_text)
+                        sent_in_cycle += 1
+                        total_sent += 1
+                        last_groups.append(group['title'])
+                        if len(last_groups) > 5:
+                            last_groups.pop(0)
+                        await asyncio.sleep(2)
+                    except:
+                        continue
                 except Exception as e:
                     logger.error(f"Error sending to {group['title']}: {e}")
                     continue
             
+            # Цикл завершен
             if sent_in_cycle > 0:
-                await bot.send_message(
-                    user_id,
-                    f"✅ <b>Цикл {cycle} завершен!</b>\n\n"
-                    f"📨 Отправлено: {sent_in_cycle} групп\n"
-                    f"📊 Всего: {total_sent}"
-                )
+                last_groups_text = "\n".join([f"• {g}" for g in last_groups[-5:]])
+                
+                try:
+                    await status_message.edit_text(
+                        f"✅ <b>Цикл {cycle} завершен!</b>\n\n"
+                        f"📨 Отправлено: <b>{sent_in_cycle}/{len(groups)}</b>\n"
+                        f"📊 Всего: <b>{total_sent}</b>\n\n"
+                        f"<b>Последние группы:</b>\n"
+                        f"{last_groups_text}\n\n"
+                        f"⏱ Следующий цикл через {task.interval_minutes} мин..."
+                    )
+                except:
+                    pass
             
-            base_interval = task.interval_minutes * 60
-            random_offset = random.randint(-300, 300)
-            next_interval = max(300, base_interval + random_offset)
-            
-            await asyncio.sleep(next_interval)
+            # Ждем интервал
+            interval_seconds = task.interval_minutes * 60
+            await asyncio.sleep(interval_seconds)
         
+        # Задача остановлена
         db = SessionLocal()
         try:
             db.query(BroadcastTask).filter_by(id=task_id).update({'status': 'completed'})
@@ -382,12 +409,14 @@ async def start_broadcast(user_id: int, task_id: int):
         finally:
             db.close()
         
-        await bot.send_message(
-            user_id,
-            f"⏹ <b>Рассылка остановлена</b>\n\n"
-            f"📊 Циклов: {cycle}\n"
-            f"📨 Отправлено: {total_sent}"
-        )
+        try:
+            await status_message.edit_text(
+                f"⏹ <b>Рассылка остановлена</b>\n\n"
+                f"📊 Циклов: {cycle}\n"
+                f"📨 Отправлено: {total_sent}"
+            )
+        except:
+            pass
         
     except Exception as e:
         logger.error(f"Broadcast error: {e}")
@@ -423,12 +452,7 @@ async def connect_account(message: types.Message):
     if not is_valid_license(message.from_user.id):
         await message.answer("❌ Нет активной лицензии!")
         return
-    
-    await message.answer(
-        "📱 <b>Подключение аккаунта</b>\n\n"
-        "Введите номер телефона:\n"
-        "<code>+79123456789</code>"
-    )
+    await message.answer("📱 Введите номер телефона:\n<code>+79123456789</code>")
     await UserStates.waiting_phone.set()
 
 @dp.message_handler(lambda message: message.text == "📨 Создать рассылку")
@@ -619,7 +643,6 @@ async def process_admin_key_duration(message: types.Message, state: FSMContext):
 @dp.message_handler(state=UserStates.waiting_phone)
 async def process_phone(message: types.Message, state: FSMContext):
     phone = message.text.strip()
-    logger.info(f"Phone received: {phone}")
     
     if not phone.startswith('+'):
         await message.answer("❌ Номер должен начинаться с '+'")
@@ -649,10 +672,6 @@ async def process_phone(message: types.Message, state: FSMContext):
         logger.error(f"Error sending code: {e}")
         await message.answer(f"❌ Ошибка: {str(e)}")
         await state.finish()
-        try:
-            await client.disconnect()
-        except:
-            pass
 
 @dp.message_handler(state=UserStates.waiting_code)
 async def process_code(message: types.Message, state: FSMContext):
@@ -671,7 +690,6 @@ async def process_code(message: types.Message, state: FSMContext):
     
     try:
         await client.sign_in(phone, phone_code_hash, code)
-        
         session_string = await client.export_session_string()
         
         db = SessionLocal()
@@ -734,7 +752,7 @@ async def process_interval(message: types.Message, state: FSMContext):
         await message.answer(
             f"✅ <b>Рассылка запущена!</b>\n\n"
             f"📝 {message_text[:100]}\n"
-            f"⏱ Интервал: {interval} мин (±5 мин)",
+            f"⏱ Интервал: {interval} мин",
             reply_markup=get_main_keyboard(message.from_user.id)
         )
         await state.finish()
