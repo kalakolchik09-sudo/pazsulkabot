@@ -503,7 +503,7 @@ async def connect_account(message: types.Message):
     if not is_valid_license(message.from_user.id):
         await message.answer("❌ Нет активной лицензии!")
         return
-    await message.answer("📱 Введите номер телефона:\n<code>+79123456789</code>")
+    await message.answer("📱 Введите номер телефона:\n<code>+380123456789</code>")
     await UserStates.waiting_phone.set()
 
 @dp.message_handler(lambda message: message.text == "📨 Создать рассылку")
