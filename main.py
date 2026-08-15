@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import random
 from datetime import datetime, timedelta
 import secrets
 
@@ -51,6 +52,7 @@ def get_database_url():
 
 DATABASE_URL = get_database_url()
 
+# Create engine
 try:
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     with engine.connect() as conn:
@@ -93,8 +95,10 @@ class BroadcastTask(Base):
     user_id = Column(BigInteger, nullable=False)
     message_text = Column(Text, nullable=False)
     interval_minutes = Column(Integer, default=30)
-    status = Column(String, default='active')
+    status = Column(String, default='active')  # active, paused, completed
     groups_count = Column(Integer, default=0)
+    current_cycle = Column(Integer, default=0)
+    sent_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(engine)
@@ -187,9 +191,7 @@ def get_admin_keyboard():
 
 # Функция рассылки
 async def start_broadcast(user_id: int, task_id: int):
-    """Запускает рассылку в фоне"""
-    logger.info(f"Starting broadcast for user {user_id}, task {task_id}")
-    
+    """Бесконечная рассылка с случайными интервалами"""
     db = SessionLocal()
     try:
         task = db.query(BroadcastTask).filter_by(id=task_id).first()
@@ -197,13 +199,8 @@ async def start_broadcast(user_id: int, task_id: int):
     finally:
         db.close()
     
-    if not task or not user:
-        logger.error("Task or user not found")
-        return
-    
-    if not user.session_string:
-        logger.error("No session string")
-        await bot.send_message(user_id, "❌ Аккаунт не подключен!")
+    if not task or not user or not user.session_string:
+        logger.error(f"No task or user or session for {user_id}")
         return
     
     client = Client(
@@ -215,39 +212,29 @@ async def start_broadcast(user_id: int, task_id: int):
     
     try:
         await client.start()
-        logger.info("Client started")
+        logger.info(f"Broadcast client started for user {user_id}")
         
-        # Получаем информацию о пользователе
-        me = await client.get_me()
-        logger.info(f"Logged in as: {me.first_name} (@{me.username})")
-        
-        await bot.send_message(user_id, f"✅ Подключен как: {me.first_name}")
-        
-        # Получаем ВСЕ диалоги
-        await bot.send_message(user_id, "📋 Получаю список групп...")
-        
+        # Получаем все группы
         dialogs = []
-        async for dialog in client.get_dialogs():
-            logger.info(f"Dialog: {dialog.chat.title} ({dialog.chat.type})")
-            if dialog.chat.type in ['group', 'supergroup']:
-                dialogs.append(dialog.chat.id)
+        try:
+            async for dialog in client.get_dialogs():
+                if dialog.chat.type in ['group', 'supergroup']:
+                    dialogs.append({
+                        'id': dialog.chat.id,
+                        'title': dialog.chat.title
+                    })
+            logger.info(f"Found {len(dialogs)} groups for user {user_id}")
+        except Exception as e:
+            logger.error(f"Error getting dialogs: {e}")
+            await bot.send_message(user_id, f"❌ Ошибка получения групп: {str(e)}")
+            return
         
-        logger.info(f"Found {len(dialogs)} groups")
-        
-        if len(dialogs) == 0:
+        if not dialogs:
             await bot.send_message(
                 user_id,
                 "❌ <b>У вас нет групп!</b>\n\n"
                 "Добавьте аккаунт в группы и попробуйте снова."
             )
-            
-            # Обновляем статус
-            db = SessionLocal()
-            try:
-                db.query(BroadcastTask).filter_by(id=task_id).update({'status': 'completed', 'groups_count': 0})
-                db.commit()
-            finally:
-                db.close()
             return
         
         # Обновляем количество групп
@@ -260,14 +247,20 @@ async def start_broadcast(user_id: int, task_id: int):
         
         await bot.send_message(
             user_id,
-            f"✅ Найдено групп: <b>{len(dialogs)}</b>\n"
-            f"Начинаю рассылку..."
+            f"🚀 <b>Рассылка запущена!</b>\n\n"
+            f"👥 Найдено групп: <b>{len(dialogs)}</b>\n"
+            f"📝 Сообщение: {task.message_text[:100]}\n"
+            f"⏱ Базовый интервал: {task.interval_minutes} мин\n"
+            f"🎲 Случайное отклонение: ±5 мин\n\n"
+            f"Начинаю отправку..."
         )
         
-        # Отправляем сообщения
-        sent_count = 0
-        for group_id in dialogs:
-            # Проверяем статус
+        cycle = 0
+        total_sent = 0
+        
+        # Бесконечный цикл рассылки
+        while True:
+            # Проверяем статус задачи
             db = SessionLocal()
             try:
                 current_task = db.query(BroadcastTask).filter_by(id=task_id).first()
@@ -275,31 +268,95 @@ async def start_broadcast(user_id: int, task_id: int):
                 db.close()
             
             if not current_task or current_task.status != 'active':
+                logger.info(f"Task {task_id} stopped")
                 break
             
-            try:
-                await client.send_message(group_id, task.message_text)
-                sent_count += 1
-                logger.info(f"Sent to {group_id}: {sent_count}/{len(dialogs)}")
+            cycle += 1
+            sent_in_cycle = 0
+            
+            logger.info(f"Starting cycle {cycle} for task {task_id}")
+            
+            # Отправляем сообщения во все группы
+            for group in dialogs:
+                # Проверяем статус
+                db = SessionLocal()
+                try:
+                    current_task = db.query(BroadcastTask).filter_by(id=task_id).first()
+                finally:
+                    db.close()
                 
-                # Уведомляем пользователя
+                if not current_task or current_task.status != 'active':
+                    break
+                
+                try:
+                    await client.send_message(group['id'], task.message_text)
+                    sent_in_cycle += 1
+                    total_sent += 1
+                    
+                    logger.info(f"Cycle {cycle}: Sent to {group['title']} ({sent_in_cycle}/{len(dialogs)})")
+                    
+                    # Обновляем счетчики
+                    db = SessionLocal()
+                    try:
+                        db.query(BroadcastTask).filter_by(id=task_id).update({
+                            'current_cycle': cycle,
+                            'sent_count': total_sent
+                        })
+                        db.commit()
+                    finally:
+                        db.close()
+                    
+                    # Уведомляем пользователя
+                    await bot.send_message(
+                        user_id,
+                        f"📨 <b>Цикл {cycle}</b>\n"
+                        f"👥 Группа: {group['title']}\n"
+                        f"📊 Прогресс: {sent_in_cycle}/{len(dialogs)}\n"
+                        f"✅ Всего отправлено: {total_sent}"
+                    )
+                    
+                    # Случайная пауза между группами (30-60 секунд)
+                    group_pause = random.randint(30, 60)
+                    await asyncio.sleep(group_pause)
+                    
+                except FloodWait as e:
+                    logger.warning(f"FloodWait: {e.value} seconds")
+                    await bot.send_message(
+                        user_id,
+                        f"⚠️ <b>Пауза из-за FloodWait</b>\n"
+                        f"⏱ Ждем {e.value} секунд..."
+                    )
+                    await asyncio.sleep(e.value)
+                except Exception as e:
+                    logger.error(f"Error sending to {group['title']}: {e}")
+                    await bot.send_message(
+                        user_id,
+                        f"❌ Ошибка отправки в {group['title']}: {str(e)}"
+                    )
+                    continue
+            
+            # Цикл завершен
+            if sent_in_cycle > 0:
                 await bot.send_message(
                     user_id,
-                    f"📨 Отправлено в группу ({sent_count}/{len(dialogs)})"
+                    f"✅ <b>Цикл {cycle} завершен!</b>\n\n"
+                    f"📨 Отправлено в {sent_in_cycle} групп\n"
+                    f"📊 Всего за все время: {total_sent}\n\n"
+                    f"⏱ Следующий цикл через {task.interval_minutes}±5 мин..."
                 )
-                
-                # Ждем интервал
-                await asyncio.sleep(task.interval_minutes * 60)
-                
-            except FloodWait as e:
-                logger.warning(f"FloodWait: {e.value} seconds")
-                await bot.send_message(user_id, f"⚠️ Пауза {e.value} сек...")
-                await asyncio.sleep(e.value)
-            except Exception as e:
-                logger.error(f"Error sending to {group_id}: {e}")
-                continue
+            
+            # Случайный интервал между циклами
+            base_interval = task.interval_minutes * 60
+            random_offset = random.randint(-300, 300)  # ±5 минут
+            next_interval = max(300, base_interval + random_offset)  # Минимум 5 минут
+            
+            next_time = datetime.now() + timedelta(seconds=next_interval)
+            logger.info(f"Next cycle in {next_interval} seconds at {next_time.strftime('%H:%M:%S')}")
+            
+            # Ждем до следующего цикла
+            await asyncio.sleep(next_interval)
         
-        # Завершаем
+        # Задача остановлена
         db = SessionLocal()
         try:
             db.query(BroadcastTask).filter_by(id=task_id).update({'status': 'completed'})
@@ -309,18 +366,16 @@ async def start_broadcast(user_id: int, task_id: int):
         
         await bot.send_message(
             user_id,
-            f"✅ <b>Рассылка завершена!</b>\n\n"
-            f"📊 Отправлено в {sent_count} групп из {len(dialogs)}"
+            f"⏹ <b>Рассылка остановлена</b>\n\n"
+            f"📊 Всего циклов: {cycle}\n"
+            f"📨 Всего отправлено: {total_sent}"
         )
         
     except Exception as e:
         logger.error(f"Broadcast error: {e}")
         await bot.send_message(user_id, f"❌ Ошибка рассылки: {str(e)}")
     finally:
-        try:
-            await client.stop()
-        except:
-            pass
+        await client.stop()
 
 # User handlers
 @dp.message_handler(commands=['start'])
@@ -350,7 +405,13 @@ async def connect_account(message: types.Message):
     if not is_valid_license(message.from_user.id):
         await message.answer("❌ Нет активной лицензии!")
         return
-    await message.answer("📱 Введите номер телефона:\n<code>+79123456789</code>")
+    
+    await message.answer(
+        "📱 <b>Подключение аккаунта</b>\n\n"
+        "Введите номер телефона в международном формате:\n"
+        "Например: <code>+79123456789</code>\n\n"
+        "⚠️ Убедитесь, что номер правильный!"
+    )
     await UserStates.waiting_phone.set()
 
 @dp.message_handler(lambda message: message.text == "📨 Создать рассылку")
@@ -404,7 +465,9 @@ async def my_broadcasts(message: types.Message):
         text += f"{status_emoji} ID: {task.id}\n"
         text += f"📝 {task.message_text[:50]}...\n"
         text += f"⏱ Интервал: {task.interval_minutes} мин\n"
-        text += f"👥 Групп: {task.groups_count}\n\n"
+        text += f"👥 Групп: {task.groups_count}\n"
+        text += f"🔄 Циклов: {task.current_cycle}\n"
+        text += f"📨 Отправлено: {task.sent_count}\n\n"
     
     await message.answer(text)
 
@@ -455,12 +518,14 @@ async def admin_stats(message: types.Message):
         total_users = db.query(User).count()
         total_keys = db.query(LicenseKey).count()
         used_keys = db.query(LicenseKey).filter_by(is_used=True).count()
+        total_broadcasts = db.query(BroadcastTask).count()
         
         await message.answer(
             f"📊 <b>Статистика:</b>\n\n"
             f"👥 Пользователей: <b>{total_users}</b>\n"
             f"🔑 Ключей: <b>{total_keys}</b>\n"
-            f"📤 Использовано: <b>{used_keys}</b>"
+            f"📤 Использовано: <b>{used_keys}</b>\n"
+            f"📨 Рассылок: <b>{total_broadcasts}</b>"
         )
     finally:
         db.close()
@@ -537,10 +602,14 @@ async def process_admin_key_duration(message: types.Message, state: FSMContext):
 @dp.message_handler(state=UserStates.waiting_phone)
 async def process_phone(message: types.Message, state: FSMContext):
     phone = message.text.strip()
+    logger.info(f"Phone received: {phone}")
     
     if not phone.startswith('+'):
-        await message.answer("❌ Номер должен начинаться с '+'")
+        await message.answer("❌ Номер должен начинаться с '+'. Попробуйте снова:")
         return
+    
+    # Отправляем сообщение о начале обработки
+    await message.answer("⏳ Отправляю код подтверждения...")
     
     client = Client(
         f"session_{message.from_user.id}",
@@ -551,18 +620,24 @@ async def process_phone(message: types.Message, state: FSMContext):
     
     try:
         await client.connect()
+        logger.info("Client connected")
+        
         sent_code = await client.send_code(phone)
+        logger.info(f"Code sent to {phone}")
         
         await state.update_data(phone=phone)
         phone_code_hashes[message.from_user.id] = sent_code.phone_code_hash
         active_clients[message.from_user.id] = client
         
-        await message.answer("📨 Код отправлен! Введите код из SMS:")
+        await message.answer(
+            "📨 <b>Код отправлен!</b>\n\n"
+            "Введите код из SMS:"
+        )
         await UserStates.waiting_code.set()
         
     except Exception as e:
         logger.error(f"Error sending code: {e}")
-        await message.answer(f"❌ Ошибка: {str(e)}")
+        await message.answer(f"❌ Ошибка отправки кода: {str(e)}")
         await state.finish()
         try:
             await client.disconnect()
@@ -578,9 +653,11 @@ async def process_code(message: types.Message, state: FSMContext):
     phone_code_hash = phone_code_hashes.get(message.from_user.id)
     
     if not client or not phone_code_hash:
-        await message.answer("❌ Сессия истекла. Попробуйте снова.")
+        await message.answer("❌ Сессия истекла. Нажмите '📱 Подключить аккаунт' снова.")
         await state.finish()
         return
+    
+    await message.answer("⏳ Проверяю код...")
     
     try:
         await client.sign_in(phone, phone_code_hash, code)
@@ -598,7 +675,7 @@ async def process_code(message: types.Message, state: FSMContext):
             db.close()
         
         await message.answer(
-            "✅ <b>Аккаунт подключен!</b>",
+            "✅ <b>Аккаунт успешно подключен!</b>",
             reply_markup=get_main_keyboard(message.from_user.id)
         )
         await state.finish()
@@ -611,7 +688,7 @@ async def process_code(message: types.Message, state: FSMContext):
 @dp.message_handler(state=UserStates.waiting_message)
 async def process_message_text(message: types.Message, state: FSMContext):
     await state.update_data(message_text=message.text)
-    await message.answer("⏱ Введите интервал в минутах (мин. 5):")
+    await message.answer("⏱ Введите базовый интервал в минутах (мин. 5):")
     await UserStates.waiting_interval.set()
 
 @dp.message_handler(state=UserStates.waiting_interval)
@@ -640,13 +717,13 @@ async def process_interval(message: types.Message, state: FSMContext):
         finally:
             db.close()
         
-        # Запускаем рассылку
+        # Запускаем рассылку в фоне
         asyncio.create_task(start_broadcast(message.from_user.id, task_id))
         
         await message.answer(
             f"✅ <b>Рассылка запущена!</b>\n\n"
             f"📝 {message_text[:100]}\n"
-            f"⏱ Интервал: {interval} мин",
+            f"⏱ Базовый интервал: {interval} мин (±5 мин)",
             reply_markup=get_main_keyboard(message.from_user.id)
         )
         await state.finish()
