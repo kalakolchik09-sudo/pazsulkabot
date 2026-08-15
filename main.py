@@ -12,7 +12,7 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.types import ParseMode, ReplyKeyboardMarkup, KeyboardButton
 from pyrogram import Client
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, PhoneCodeExpired, PhoneCodeInvalid, SessionPasswordNeeded
 
 # Database imports
 from sqlalchemy import create_engine, Column, Integer, BigInteger, String, DateTime, Boolean, Text, text
@@ -113,6 +113,7 @@ logger.info("✅ Tables ready")
 class UserStates(StatesGroup):
     waiting_phone = State()
     waiting_code = State()
+    waiting_password = State()  # Для 2FA
     waiting_message = State()
     waiting_interval = State()
     waiting_license = State()
@@ -521,7 +522,8 @@ async def process_phone(message: types.Message, state: FSMContext):
         
         await message.answer(
             "📨 <b>Код отправлен!</b>\n\n"
-            "Введите код из SMS:"
+            "Введите код из SMS.\n"
+            "⚠️ Код действителен 5 минут!"
         )
         await UserStates.waiting_code.set()
     except Exception as e:
@@ -545,7 +547,33 @@ async def process_code(message: types.Message, state: FSMContext):
     
     try:
         await client.connect()
-        await client.sign_in(phone, phone_code_hash, code)
+        
+        try:
+            await client.sign_in(phone, phone_code_hash, code)
+        except SessionPasswordNeeded:
+            # Требуется 2FA пароль
+            await message.answer(
+                "🔐 <b>Требуется двухфакторная аутентификация</b>\n\n"
+                "Введите ваш пароль 2FA:"
+            )
+            await UserStates.waiting_password.set()
+            await client.disconnect()
+            return
+        except PhoneCodeExpired:
+            await message.answer(
+                "❌ <b>Код истек!</b>\n\n"
+                "Нажмите кнопку '📱 Подключить аккаунт' снова, чтобы получить новый код."
+            )
+            await state.finish()
+            await client.disconnect()
+            return
+        except PhoneCodeInvalid:
+            await message.answer(
+                "❌ <b>Неверный код!</b>\n\n"
+                "Проверьте код и попробуйте снова."
+            )
+            await client.disconnect()
+            return
         
         session_string = await client.export_session_string()
         
@@ -562,15 +590,70 @@ async def process_code(message: types.Message, state: FSMContext):
         active_clients[message.from_user.id] = client
         
         await message.answer(
-            "✅ <b>Аккаунт подключен!</b>",
+            "✅ <b>Аккаунт успешно подключен!</b>",
             reply_markup=get_main_keyboard(message.from_user.id)
         )
         await state.finish()
         
     except Exception as e:
         logger.error(f"Error signing in: {e}")
-        await message.answer(f"❌ Ошибка входа: {str(e)}")
+        await message.answer(
+            f"❌ Ошибка входа: {str(e)}\n\n"
+            f"Попробуйте снова, нажав кнопку '📱 Подключить аккаунт'"
+        )
         await state.finish()
+    finally:
+        try:
+            await client.disconnect()
+        except:
+            pass
+
+@dp.message_handler(state=UserStates.waiting_password)
+async def process_2fa_password(message: types.Message, state: FSMContext):
+    password = message.text.strip()
+    data = await state.get_data()
+    phone = data.get('phone')
+    
+    client = Client(
+        f"session_{message.from_user.id}",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        in_memory=True
+    )
+    
+    try:
+        await client.connect()
+        await client.check_password(password)
+        
+        session_string = await client.export_session_string()
+        
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(user_id=message.from_user.id).first()
+            if user:
+                user.phone_number = phone
+                user.session_string = session_string
+                db.commit()
+        finally:
+            db.close()
+        
+        active_clients[message.from_user.id] = client
+        
+        await message.answer(
+            "✅ <b>Аккаунт успешно подключен!</b>",
+            reply_markup=get_main_keyboard(message.from_user.id)
+        )
+        await state.finish()
+        
+    except Exception as e:
+        logger.error(f"Error with 2FA: {e}")
+        await message.answer(f"❌ Ошибка: {str(e)}")
+        await state.finish()
+    finally:
+        try:
+            await client.disconnect()
+        except:
+            pass
 
 @dp.message_handler(state=UserStates.waiting_message)
 async def process_message_text(message: types.Message, state: FSMContext):
