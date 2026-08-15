@@ -12,7 +12,7 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.types import ParseMode, ReplyKeyboardMarkup, KeyboardButton
 from pyrogram import Client
-from pyrogram.errors import FloodWait, PhoneCodeExpired, PhoneCodeInvalid, SessionPasswordNeeded
+from pyrogram.errors import FloodWait, PhoneCodeExpired, PhoneCodeInvalid, SessionPasswordNeeded, PasswordHashInvalid
 from pyrogram.enums import ChatType
 
 # Database imports
@@ -740,7 +740,26 @@ async def process_code(message: types.Message, state: FSMContext):
     await message.answer("⏳ Проверяю код...")
     
     try:
-        await client.sign_in(phone, phone_code_hash, code)
+        # Пробуем войти без пароля
+        try:
+            await client.sign_in(phone, phone_code_hash, code)
+        except SessionPasswordNeeded:
+            # Требуется 2FA пароль
+            await message.answer(
+                "🔐 <b>Требуется двухфакторная аутентификация</b>\n\n"
+                "Введите ваш пароль 2FA:"
+            )
+            await UserStates.waiting_password.set()
+            return
+        except PhoneCodeInvalid:
+            await message.answer("❌ Неверный код. Проверьте и попробуйте снова.")
+            return
+        except PhoneCodeExpired:
+            await message.answer("❌ Код истек. Нажмите '📱 Подключить аккаунт' снова.")
+            await state.finish()
+            return
+        
+        # Если нет 2FA, сохраняем сессию
         session_string = await client.export_session_string()
         
         db = SessionLocal()
@@ -761,6 +780,49 @@ async def process_code(message: types.Message, state: FSMContext):
         
     except Exception as e:
         logger.error(f"Error signing in: {e}")
+        await message.answer(f"❌ Ошибка: {str(e)}")
+        await state.finish()
+
+@dp.message_handler(state=UserStates.waiting_password)
+async def process_password(message: types.Message, state: FSMContext):
+    password = message.text.strip()
+    data = await state.get_data()
+    phone = data.get('phone')
+    client = active_clients.get(message.from_user.id)
+    
+    if not client:
+        await message.answer("❌ Сессия истекла. Нажмите '📱 Подключить аккаунт' снова.")
+        await state.finish()
+        return
+    
+    await message.answer("⏳ Проверяю пароль...")
+    
+    try:
+        # Входим с паролем 2FA
+        await client.check_password(password)
+        
+        session_string = await client.export_session_string()
+        
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(user_id=message.from_user.id).first()
+            if user:
+                user.phone_number = phone
+                user.session_string = session_string
+                db.commit()
+        finally:
+            db.close()
+        
+        await message.answer(
+            "✅ <b>Аккаунт успешно подключен!</b>",
+            reply_markup=get_main_keyboard(message.from_user.id)
+        )
+        await state.finish()
+        
+    except PasswordHashInvalid:
+        await message.answer("❌ Неверный пароль 2FA. Попробуйте снова:")
+    except Exception as e:
+        logger.error(f"Error with 2FA: {e}")
         await message.answer(f"❌ Ошибка: {str(e)}")
         await state.finish()
 
