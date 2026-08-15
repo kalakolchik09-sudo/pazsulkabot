@@ -33,26 +33,20 @@ if not BOT_TOKEN:
     logger.error("❌ BOT_TOKEN не указан!")
     raise ValueError("BOT_TOKEN is required")
 
-logger.info(f"✅ Bot token: {BOT_TOKEN[:10]}...")
-logger.info(f"✅ Admin ID: {ADMIN_ID}")
-
 # Database URL
 def get_database_url():
     public_url = os.getenv('DATABASE_PUBLIC_URL', '')
     if public_url:
         if public_url.startswith('postgres://'):
             public_url = public_url.replace('postgres://', 'postgresql://', 1)
-        logger.info("Using DATABASE_PUBLIC_URL")
         return public_url.strip()
     
     db_url = os.getenv('DATABASE_URL', '')
     if db_url:
         if db_url.startswith('postgres://'):
             db_url = db_url.replace('postgres://', 'postgresql://', 1)
-        logger.info("Using DATABASE_URL")
         return db_url.strip()
     
-    logger.info("Using SQLite")
     return 'sqlite:///bot.db'
 
 DATABASE_URL = get_database_url()
@@ -62,12 +56,11 @@ try:
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
-    logger.info("✅ Database connection successful!")
+    logger.info("✅ Database connected")
 except Exception as e:
-    logger.error(f"❌ Database error: {e}")
+    logger.error(f"Database error: {e}")
     DATABASE_URL = 'sqlite:///bot.db'
     engine = create_engine(DATABASE_URL)
-    logger.info("Using SQLite fallback")
 
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
@@ -105,9 +98,7 @@ class BroadcastTask(Base):
     groups_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# Create tables
 Base.metadata.create_all(engine)
-logger.info("✅ Tables ready")
 
 # States
 class UserStates(StatesGroup):
@@ -126,9 +117,9 @@ storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 dp.middleware.setup(LoggingMiddleware())
 
-# Хранилище для клиентов и данных
 active_clients = {}
-phone_code_hashes = {}  # Храним хэши кодов
+phone_code_hashes = {}
+broadcast_tasks = {}
 
 # Helper functions
 def generate_license_key(duration_days: int) -> str:
@@ -164,18 +155,13 @@ def create_user_if_not_exists(user_id: int, username: str = None, first_name: st
             user = User(user_id=user_id, username=username, first_name=first_name)
             db.add(user)
             db.commit()
-            logger.info(f"New user created: {user_id}")
         return user
-    except Exception as e:
-        logger.error(f"Error creating user: {e}")
-        db.rollback()
     finally:
         db.close()
 
 # Keyboards
 def get_main_keyboard(user_id: int):
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    
     if is_valid_license(user_id):
         keyboard.add(
             KeyboardButton("📱 Подключить аккаунт"),
@@ -187,7 +173,6 @@ def get_main_keyboard(user_id: int):
         )
     else:
         keyboard.add(KeyboardButton("🔑 Активировать лицензию"))
-    
     return keyboard
 
 def get_admin_keyboard():
@@ -200,59 +185,138 @@ def get_admin_keyboard():
         KeyboardButton("📊 Статистика"),
         KeyboardButton("🚫 Заблокировать")
     )
-    keyboard.add(KeyboardButton("⬅️ Главное меню"))
     return keyboard
+
+# Функция рассылки
+async def start_broadcast(user_id: int, task_id: int):
+    """Запускает рассылку в фоне"""
+    db = SessionLocal()
+    try:
+        task = db.query(BroadcastTask).filter_by(id=task_id).first()
+        user = db.query(User).filter_by(user_id=user_id).first()
+    finally:
+        db.close()
+    
+    if not task or not user or not user.session_string:
+        return
+    
+    client = Client(
+        f"broadcast_{user_id}_{task_id}",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        session_string=user.session_string
+    )
+    
+    try:
+        await client.start()
+        logger.info(f"Broadcast client started for user {user_id}")
+        
+        # Получаем все группы
+        dialogs = []
+        async for dialog in client.get_dialogs():
+            if dialog.chat.type in ['group', 'supergroup']:
+                dialogs.append(dialog.chat.id)
+        
+        logger.info(f"Found {len(dialogs)} groups for user {user_id}")
+        
+        # Обновляем количество групп
+        db = SessionLocal()
+        try:
+            db.query(BroadcastTask).filter_by(id=task_id).update({'groups_count': len(dialogs)})
+            db.commit()
+        finally:
+            db.close()
+        
+        # Отправляем сообщения
+        sent_count = 0
+        for group_id in dialogs:
+            # Проверяем статус задачи
+            db = SessionLocal()
+            try:
+                current_task = db.query(BroadcastTask).filter_by(id=task_id).first()
+            finally:
+                db.close()
+            
+            if not current_task or current_task.status != 'active':
+                break
+            
+            try:
+                await client.send_message(group_id, task.message_text)
+                sent_count += 1
+                logger.info(f"Sent to {group_id}: {sent_count}/{len(dialogs)}")
+                
+                # Отправляем уведомление пользователю
+                await bot.send_message(
+                    user_id,
+                    f"📨 Отправлено в группу {group_id} ({sent_count}/{len(dialogs)})"
+                )
+                
+                # Ждем интервал
+                await asyncio.sleep(task.interval_minutes * 60)
+                
+            except FloodWait as e:
+                logger.warning(f"FloodWait: {e.value} seconds")
+                await bot.send_message(user_id, f"⚠️ Пауза {e.value} сек...")
+                await asyncio.sleep(e.value)
+            except Exception as e:
+                logger.error(f"Error sending to {group_id}: {e}")
+                continue
+        
+        # Завершаем задачу
+        db = SessionLocal()
+        try:
+            db.query(BroadcastTask).filter_by(id=task_id).update({'status': 'completed'})
+            db.commit()
+        finally:
+            db.close()
+        
+        await bot.send_message(
+            user_id,
+            f"✅ <b>Рассылка завершена!</b>\n\n"
+            f"📊 Отправлено в {sent_count} групп"
+        )
+        
+    except Exception as e:
+        logger.error(f"Broadcast error: {e}")
+        await bot.send_message(user_id, f"❌ Ошибка рассылки: {str(e)}")
+    finally:
+        await client.stop()
 
 # User handlers
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
-    logger.info(f"Start command from user {message.from_user.id}")
     create_user_if_not_exists(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    
     await message.answer(
         f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
-        f"Я бот для рассылки сообщений в группы.\n\n"
         f"Используйте кнопки ниже:",
         reply_markup=get_main_keyboard(message.from_user.id)
     )
 
 @dp.message_handler(commands=['admin'])
 async def cmd_admin(message: types.Message):
-    logger.info(f"Admin command from user {message.from_user.id}")
-    
     if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔️ У вас нет доступа к админ-панели.")
+        await message.answer("⛔️ Нет доступа")
         return
-    
-    await message.answer(
-        "🔐 <b>Админ-панель</b>\n\n"
-        "Выберите действие:",
-        reply_markup=get_admin_keyboard()
-    )
+    await message.answer("🔐 Админ-панель:", reply_markup=get_admin_keyboard())
 
 # Кнопки
 @dp.message_handler(lambda message: message.text == "🔑 Активировать лицензию")
 async def activate_license(message: types.Message):
-    await message.answer("🔑 Введите ваш лицензионный ключ:")
+    await message.answer("🔑 Введите лицензионный ключ:")
     await UserStates.waiting_license.set()
 
 @dp.message_handler(lambda message: message.text == "📱 Подключить аккаунт")
 async def connect_account(message: types.Message):
     if not is_valid_license(message.from_user.id):
-        await message.answer("❌ У вас нет активной лицензии!")
+        await message.answer("❌ Нет активной лицензии!")
         return
-    
-    await message.answer(
-        "📱 <b>Подключение аккаунта</b>\n\n"
-        "Введите номер телефона в формате:\n"
-        "<code>+79123456789</code>"
-    )
+    await message.answer("📱 Введите номер телефона:\n<code>+79123456789</code>")
     await UserStates.waiting_phone.set()
 
 @dp.message_handler(lambda message: message.text == "📨 Создать рассылку")
 async def create_broadcast(message: types.Message):
     if not is_valid_license(message.from_user.id):
-        await message.answer("❌ У вас нет активной лицензии!")
+        await message.answer("❌ Нет активной лицензии!")
         return
     
     db = SessionLocal()
@@ -264,7 +328,7 @@ async def create_broadcast(message: types.Message):
     finally:
         db.close()
     
-    await message.answer("📝 <b>Создание рассылки</b>\n\nВведите текст сообщения:")
+    await message.answer("📝 Введите текст сообщения для рассылки:")
     await UserStates.waiting_message.set()
 
 @dp.message_handler(lambda message: message.text == "⏹ Остановить рассылки")
@@ -278,8 +342,7 @@ async def stop_broadcasts(message: types.Message):
         db.commit()
     finally:
         db.close()
-    
-    await message.answer("✅ Все рассылки остановлены.")
+    await message.answer("✅ Рассылки остановлены.")
 
 @dp.message_handler(lambda message: message.text == "📊 Мои рассылки")
 async def my_broadcasts(message: types.Message):
@@ -300,7 +363,8 @@ async def my_broadcasts(message: types.Message):
         status_emoji = "✅" if task.status == 'completed' else "🔄" if task.status == 'active' else "⏸"
         text += f"{status_emoji} ID: {task.id}\n"
         text += f"📝 {task.message_text[:50]}...\n"
-        text += f"⏱ Интервал: {task.interval_minutes} мин\n\n"
+        text += f"⏱ Интервал: {task.interval_minutes} мин\n"
+        text += f"👥 Групп: {task.groups_count}\n\n"
     
     await message.answer(text)
 
@@ -310,14 +374,7 @@ async def admin_create_key(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("⛔️ Нет доступа")
         return
-    
-    await message.answer(
-        "🔑 <b>Создание ключа</b>\n\n"
-        "Введите срок действия:\n"
-        "• <code>30</code> - на месяц\n"
-        "• <code>365</code> - на год\n"
-        "• <code>-1</code> - навсегда"
-    )
+    await message.answer("🔑 Введите срок (дней, -1 для бессрочного):")
     await UserStates.admin_create_key.set()
 
 @dp.message_handler(lambda message: message.text == "👥 Пользователи")
@@ -329,7 +386,6 @@ async def admin_users(message: types.Message):
     db = SessionLocal()
     try:
         users = db.query(User).all()
-        
         if not users:
             await message.answer("Нет пользователей.")
             return
@@ -342,7 +398,7 @@ async def admin_users(message: types.Message):
             text += f"👤 {user.first_name or 'Нет имени'}"
             if user.username:
                 text += f" (@{user.username})"
-            text += f"\n🔑 Лицензия: {license_status}\n\n"
+            text += f"\n🔑 {license_status}\n\n"
         
         await message.answer(text)
     finally:
@@ -359,12 +415,14 @@ async def admin_stats(message: types.Message):
         total_users = db.query(User).count()
         total_keys = db.query(LicenseKey).count()
         used_keys = db.query(LicenseKey).filter_by(is_used=True).count()
+        total_broadcasts = db.query(BroadcastTask).count()
         
         await message.answer(
             f"📊 <b>Статистика:</b>\n\n"
             f"👥 Пользователей: <b>{total_users}</b>\n"
             f"🔑 Ключей: <b>{total_keys}</b>\n"
-            f"📤 Использовано: <b>{used_keys}</b>"
+            f"📤 Использовано: <b>{used_keys}</b>\n"
+            f"📨 Рассылок: <b>{total_broadcasts}</b>"
         )
     finally:
         db.close()
@@ -374,37 +432,28 @@ async def admin_block_user(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("⛔️ Нет доступа")
         return
-    
-    await message.answer("Введите ID пользователя для блокировки/разблокировки:")
+    await message.answer("Введите ID пользователя:")
     await UserStates.admin_block_user.set()
-
-@dp.message_handler(lambda message: message.text == "⬅️ Главное меню")
-async def back_to_main(message: types.Message):
-    if message.from_user.id == ADMIN_ID:
-        await message.answer("Вы в главном меню.", reply_markup=get_admin_keyboard())
-    else:
-        await message.answer("Вы в главном меню.", reply_markup=get_main_keyboard(message.from_user.id))
 
 # Обработка состояний
 @dp.message_handler(state=UserStates.waiting_license)
 async def process_license_key(message: types.Message, state: FSMContext):
     license_key = message.text.strip()
-    
     db = SessionLocal()
     try:
         license_obj = db.query(LicenseKey).filter_by(key=license_key).first()
         
         if not license_obj:
-            await message.answer("❌ Неверный ключ. Попробуйте снова.")
+            await message.answer("❌ Неверный ключ.")
             return
         
         if license_obj.is_used:
-            await message.answer("❌ Этот ключ уже использован.")
+            await message.answer("❌ Ключ уже использован.")
             return
         
         user = db.query(User).filter_by(user_id=message.from_user.id).first()
         if not user:
-            await message.answer("❌ Нажмите /start сначала.")
+            await message.answer("❌ Нажмите /start")
             return
         
         if license_obj.duration_days == -1:
@@ -419,8 +468,8 @@ async def process_license_key(message: types.Message, state: FSMContext):
         db.commit()
         
         await message.answer(
-            f"✅ <b>Лицензия активирована!</b>\n\n"
-            f"📅 Действует до: <b>{expiry.strftime('%d.%m.%Y')}</b>",
+            f"✅ <b>Лицензия активирована!</b>\n"
+            f"📅 До: <b>{expiry.strftime('%d.%m.%Y')}</b>",
             reply_markup=get_main_keyboard(message.from_user.id)
         )
         await state.finish()
@@ -442,27 +491,19 @@ async def process_admin_key_duration(message: types.Message, state: FSMContext):
             db.close()
         
         duration_text = "Бессрочная" if duration == -1 else f"{duration} дней"
-        
-        await message.answer(
-            f"✅ <b>Ключ создан!</b>\n\n"
-            f"🔑 Ключ: <code>{key}</code>\n"
-            f"📅 Срок: {duration_text}"
-        )
+        await message.answer(f"✅ Ключ: <code>{key}</code>\nСрок: {duration_text}")
         await state.finish()
-        
     except ValueError:
         await message.answer("❌ Введите число.")
 
 @dp.message_handler(state=UserStates.waiting_phone)
 async def process_phone(message: types.Message, state: FSMContext):
     phone = message.text.strip()
-    logger.info(f"Phone entered: {phone}")
     
     if not phone.startswith('+'):
-        await message.answer("❌ Номер должен начинаться с '+'. Попробуйте снова.")
+        await message.answer("❌ Номер должен начинаться с '+'")
         return
     
-    # Создаем клиента и ОСТАВЛЯЕМ его подключенным
     client = Client(
         f"session_{message.from_user.id}",
         api_id=API_ID,
@@ -474,19 +515,11 @@ async def process_phone(message: types.Message, state: FSMContext):
         await client.connect()
         sent_code = await client.send_code(phone)
         
-        # Сохраняем ВСЕ данные
         await state.update_data(phone=phone)
         phone_code_hashes[message.from_user.id] = sent_code.phone_code_hash
-        
-        # НЕ отключаем клиента!
         active_clients[message.from_user.id] = client
         
-        logger.info(f"Code sent to {phone}, hash: {sent_code.phone_code_hash[:20]}...")
-        
-        await message.answer(
-            "📨 <b>Код отправлен!</b>\n\n"
-            "Введите код из SMS:"
-        )
+        await message.answer("📨 Код отправлен! Введите код из SMS:")
         await UserStates.waiting_code.set()
         
     except Exception as e:
@@ -503,49 +536,17 @@ async def process_code(message: types.Message, state: FSMContext):
     code = message.text.strip()
     data = await state.get_data()
     phone = data.get('phone')
-    
-    # Получаем сохраненного клиента
     client = active_clients.get(message.from_user.id)
-    
-    if not client:
-        await message.answer("❌ Сессия истекла. Нажмите '📱 Подключить аккаунт' снова.")
-        await state.finish()
-        return
-    
     phone_code_hash = phone_code_hashes.get(message.from_user.id)
     
-    if not phone_code_hash:
-        await message.answer("❌ Хэш кода не найден. Попробуйте снова.")
+    if not client or not phone_code_hash:
+        await message.answer("❌ Сессия истекла. Попробуйте снова.")
         await state.finish()
         return
     
     try:
-        logger.info(f"Attempting to sign in with code: {code}")
+        await client.sign_in(phone, phone_code_hash, code)
         
-        try:
-            await client.sign_in(phone, phone_code_hash, code)
-        except SessionPasswordNeeded:
-            await message.answer(
-                "🔐 <b>Требуется 2FA пароль</b>\n\n"
-                "Введите ваш пароль:"
-            )
-            await UserStates.waiting_password.set()
-            return
-        except PhoneCodeExpired:
-            await message.answer(
-                "❌ <b>Код истек!</b>\n\n"
-                "Нажмите '📱 Подключить аккаунт' снова."
-            )
-            await state.finish()
-            return
-        except PhoneCodeInvalid:
-            await message.answer(
-                "❌ <b>Неверный код!</b>\n\n"
-                "Проверьте код и введите снова."
-            )
-            return
-        
-        # Успешный вход
         session_string = await client.export_session_string()
         
         db = SessionLocal()
@@ -559,51 +560,13 @@ async def process_code(message: types.Message, state: FSMContext):
             db.close()
         
         await message.answer(
-            "✅ <b>Аккаунт успешно подключен!</b>",
+            "✅ <b>Аккаунт подключен!</b>",
             reply_markup=get_main_keyboard(message.from_user.id)
         )
         await state.finish()
         
     except Exception as e:
         logger.error(f"Error signing in: {e}")
-        await message.answer(f"❌ Ошибка: {str(e)}")
-        await state.finish()
-
-@dp.message_handler(state=UserStates.waiting_password)
-async def process_2fa_password(message: types.Message, state: FSMContext):
-    password = message.text.strip()
-    client = active_clients.get(message.from_user.id)
-    
-    if not client:
-        await message.answer("❌ Сессия истекла.")
-        await state.finish()
-        return
-    
-    try:
-        await client.check_password(password)
-        
-        session_string = await client.export_session_string()
-        data = await state.get_data()
-        phone = data.get('phone')
-        
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter_by(user_id=message.from_user.id).first()
-            if user:
-                user.phone_number = phone
-                user.session_string = session_string
-                db.commit()
-        finally:
-            db.close()
-        
-        await message.answer(
-            "✅ <b>Аккаунт успешно подключен!</b>",
-            reply_markup=get_main_keyboard(message.from_user.id)
-        )
-        await state.finish()
-        
-    except Exception as e:
-        logger.error(f"2FA error: {e}")
         await message.answer(f"❌ Ошибка: {str(e)}")
         await state.finish()
 
@@ -634,11 +597,16 @@ async def process_interval(message: types.Message, state: FSMContext):
             )
             db.add(task)
             db.commit()
+            db.refresh(task)
+            task_id = task.id
         finally:
             db.close()
         
+        # Запускаем рассылку в фоне
+        asyncio.create_task(start_broadcast(message.from_user.id, task_id))
+        
         await message.answer(
-            f"✅ <b>Рассылка создана!</b>\n\n"
+            f"✅ <b>Рассылка запущена!</b>\n\n"
             f"📝 {message_text[:100]}\n"
             f"⏱ Интервал: {interval} мин",
             reply_markup=get_main_keyboard(message.from_user.id)
@@ -672,19 +640,17 @@ async def process_admin_block_user_id(message: types.Message, state: FSMContext)
 
 # Startup
 async def on_startup(dp):
-    logger.info("✅ Bot started successfully!")
+    logger.info("✅ Bot started!")
     try:
-        await bot.send_message(ADMIN_ID, "✅ Бот запущен!\nИспользуйте /admin")
+        await bot.send_message(ADMIN_ID, "✅ Бот запущен!")
     except:
         pass
 
-# Error handler
 @dp.errors_handler()
 async def errors_handler(update, error):
     logger.error(f"Error: {error}")
     return True
 
-# Main
 if __name__ == '__main__':
     logger.info("🚀 Starting bot...")
     from aiogram import executor
