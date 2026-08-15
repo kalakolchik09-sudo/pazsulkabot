@@ -15,7 +15,6 @@ from pyrogram import Client
 from pyrogram.errors import FloodWait
 
 # Database imports
-import psycopg2
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -30,30 +29,86 @@ API_HASH = os.getenv('API_HASH', '')
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 
-# Database URL
-DATABASE_URL = os.getenv('DATABASE_URL', '')
+# Database URL - try multiple options
+def get_database_url():
+    """Try different database URLs in order"""
+    
+    # 1. Try DATABASE_PUBLIC_URL first (for external connections)
+    public_url = os.getenv('DATABASE_PUBLIC_URL', '')
+    if public_url:
+        if public_url.startswith('postgres://'):
+            public_url = public_url.replace('postgres://', 'postgresql://', 1)
+        logger.info("Using DATABASE_PUBLIC_URL")
+        return public_url.strip()
+    
+    # 2. Try DATABASE_URL
+    db_url = os.getenv('DATABASE_URL', '')
+    if db_url:
+        if db_url.startswith('postgres://'):
+            db_url = db_url.replace('postgres://', 'postgresql://', 1)
+        
+        # Check if it's internal URL
+        if 'railway.internal' in db_url:
+            # Try to use public URL instead
+            logger.info("Internal URL detected, trying public URL")
+            # Try to construct public URL from parts
+            pg_host = os.getenv('PGHOST', '')
+            if pg_host and 'railway.internal' in pg_host:
+                # Use proxy host
+                public_host = pg_host.replace('postgres.railway.internal', 'altaria.proxy.rlwy.net')
+                pg_port = os.getenv('PGPORT', '5432')
+                pg_user = os.getenv('PGUSER', 'postgres')
+                pg_password = os.getenv('PGPASSWORD', '')
+                pg_database = os.getenv('PGDATABASE', 'railway')
+                
+                # Use port 50439 for public access
+                public_url = f'postgresql://{pg_user}:{pg_password}@{public_host}:50439/{pg_database}'
+                logger.info("Constructed public URL")
+                return public_url
+        
+        logger.info("Using DATABASE_URL")
+        return db_url.strip()
+    
+    # 3. Try individual variables
+    pg_host = os.getenv('PGHOST', '')
+    pg_port = os.getenv('PGPORT', '5432')
+    pg_user = os.getenv('PGUSER', '')
+    pg_password = os.getenv('PGPASSWORD', '')
+    pg_database = os.getenv('PGDATABASE', '')
+    
+    if pg_host and pg_user and pg_database:
+        # Use public proxy
+        if 'railway.internal' in pg_host:
+            pg_host = 'altaria.proxy.rlwy.net'
+            pg_port = '50439'
+        
+        db_url = f'postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_database}'
+        logger.info("Built URL from individual variables")
+        return db_url
+    
+    # 4. Fallback to SQLite
+    logger.warning("No database URL found, using SQLite")
+    return 'sqlite:///bot.db'
 
-if DATABASE_URL:
-    if DATABASE_URL.startswith('postgres://'):
-        DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
-    DATABASE_URL = DATABASE_URL.strip().strip('"').strip("'")
-    logger.info(f"Using PostgreSQL database")
-else:
-    DATABASE_URL = 'sqlite:///bot.db'
-    logger.info("Using SQLite database")
+DATABASE_URL = get_database_url()
+logger.info(f"Database URL: {DATABASE_URL[:50]}...")
 
 # Create engine
 try:
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        connect_args={'sslmode': 'disable'} if 'postgresql' in DATABASE_URL else {}
+    )
     # Test connection
     with engine.connect() as conn:
         conn.execute("SELECT 1")
-    logger.info("Database connection successful")
+    logger.info("Database connection successful!")
 except Exception as e:
     logger.error(f"Database error: {e}")
+    logger.info("Using SQLite fallback")
     DATABASE_URL = 'sqlite:///bot.db'
     engine = create_engine(DATABASE_URL)
-    logger.info("Using SQLite fallback")
 
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
