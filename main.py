@@ -2,9 +2,8 @@ import os
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict
 import secrets
-import json
+import re
 
 # Telegram imports
 from aiogram import Bot, Dispatcher, types
@@ -14,13 +13,13 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram import Client
-from pyrogram.errors import FloodWait, PeerIdInvalid, UserAlreadyParticipant
+from pyrogram.errors import FloodWait
 
 # Database imports
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy import and_
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 # Configuration
 logging.basicConfig(level=logging.INFO)
@@ -32,12 +31,66 @@ API_HASH = os.getenv('API_HASH', '')
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 
-# Database setup
-DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///bot_database.db')
-if DATABASE_URL.startswith('postgres://'):
-    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+# Database setup for Railway
+def get_database_url():
+    """Get and fix database URL from environment"""
+    db_url = os.getenv('DATABASE_URL', '')
+    
+    if not db_url:
+        # Fallback to SQLite
+        return 'sqlite:///bot_database.db'
+    
+    # Fix PostgreSQL URL format
+    if db_url.startswith('postgres://'):
+        db_url = db_url.replace('postgres://', 'postgresql://', 1)
+    elif db_url.startswith('postgresql://'):
+        pass  # Already correct
+    else:
+        # Try to construct from individual variables
+        pg_host = os.getenv('PGHOST', '')
+        pg_port = os.getenv('PGPORT', '5432')
+        pg_user = os.getenv('PGUSER', '')
+        pg_password = os.getenv('PGPASSWORD', '')
+        pg_database = os.getenv('PGDATABASE', '')
+        
+        if pg_host and pg_user and pg_database:
+            db_url = f'postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_database}'
+        else:
+            return 'sqlite:///bot_database.db'
+    
+    # Remove any special characters that might cause issues
+    db_url = db_url.strip()
+    
+    # Add SSL mode if not present
+    if 'sslmode' not in db_url:
+        if '?' in db_url:
+            db_url += '&sslmode=disable'
+        else:
+            db_url += '?sslmode=disable'
+    
+    logger.info(f"Using database URL: {db_url[:50]}...")  # Log only beginning for security
+    
+    return db_url
 
-engine = create_engine(DATABASE_URL)
+# Create engine with proper settings
+DATABASE_URL = get_database_url()
+
+try:
+    engine = create_engine(
+        DATABASE_URL,
+        pool_size=5,
+        max_overflow=10,
+        pool_timeout=30,
+        pool_recycle=1800,
+        pool_pre_ping=True,
+        echo=False
+    )
+    logger.info("Database engine created successfully")
+except Exception as e:
+    logger.error(f"Error creating engine: {e}")
+    # Fallback to SQLite
+    engine = create_engine('sqlite:///bot_database.db')
+
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
@@ -77,7 +130,12 @@ class BroadcastTask(Base):
     groups_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-Base.metadata.create_all(engine)
+# Create tables
+try:
+    Base.metadata.create_all(engine)
+    logger.info("Database tables created successfully")
+except Exception as e:
+    logger.error(f"Error creating tables: {e}")
 
 # States
 class UserStates(StatesGroup):
@@ -95,62 +153,50 @@ dp.middleware.setup(LoggingMiddleware())
 
 # Store active clients and tasks
 active_clients = {}
-broadcast_tasks = {}
 
 # Helper functions
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
 def generate_license_key(duration_days: int) -> str:
     """Generate unique license key"""
     db = SessionLocal()
-    while True:
-        key = f"LIC-{secrets.token_urlsafe(16).upper()}"
-        if not db.query(LicenseKey).filter_by(key=key).first():
-            break
-    db.close()
+    try:
+        while True:
+            key = f"LIC-{secrets.token_urlsafe(16).upper()}"
+            if not db.query(LicenseKey).filter_by(key=key).first():
+                break
+    finally:
+        db.close()
     return key
 
 def is_valid_license(user_id: int) -> bool:
     """Check if user has valid license"""
     db = SessionLocal()
-    user = db.query(User).filter_by(user_id=user_id).first()
-    db.close()
-    
-    if not user or user.is_blocked:
-        return False
-    
-    if not user.license_expiry:
-        return False
-    
-    if user.license_expiry < datetime.utcnow():
-        return False
-    
-    return True
-
-def get_user_by_id(user_id: int):
-    db = SessionLocal()
-    user = db.query(User).filter_by(user_id=user_id).first()
-    db.close()
-    return user
+    try:
+        user = db.query(User).filter_by(user_id=user_id).first()
+        if not user or user.is_blocked:
+            return False
+        if not user.license_expiry:
+            return False
+        if user.license_expiry < datetime.utcnow():
+            return False
+        return True
+    finally:
+        db.close()
 
 def create_user_if_not_exists(user_id: int, username: str = None, first_name: str = None):
     db = SessionLocal()
-    user = db.query(User).filter_by(user_id=user_id).first()
-    if not user:
-        user = User(
-            user_id=user_id,
-            username=username,
-            first_name=first_name
-        )
-        db.add(user)
-        db.commit()
-    db.close()
-    return user
+    try:
+        user = db.query(User).filter_by(user_id=user_id).first()
+        if not user:
+            user = User(
+                user_id=user_id,
+                username=username,
+                first_name=first_name
+            )
+            db.add(user)
+            db.commit()
+        return user
+    finally:
+        db.close()
 
 # Keyboards
 def get_main_keyboard(user_id: int):
@@ -161,8 +207,7 @@ def get_main_keyboard(user_id: int):
             InlineKeyboardButton("📱 Подключить аккаунт", callback_data="connect_account"),
             InlineKeyboardButton("📨 Создать рассылку", callback_data="create_broadcast"),
             InlineKeyboardButton("⏹ Остановить рассылки", callback_data="stop_broadcasts"),
-            InlineKeyboardButton("📊 Мои рассылки", callback_data="my_broadcasts"),
-            InlineKeyboardButton("🔑 Активировать лицензию", callback_data="activate_license")
+            InlineKeyboardButton("📊 Мои рассылки", callback_data="my_broadcasts")
         )
     else:
         keyboard.add(
@@ -184,7 +229,7 @@ def get_admin_keyboard():
 # User handlers
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
-    user = create_user_if_not_exists(
+    create_user_if_not_exists(
         message.from_user.id,
         message.from_user.username,
         message.from_user.first_name
@@ -199,7 +244,6 @@ async def cmd_start(message: types.Message):
 ✅ Подключение вашего аккаунта Telegram
 ✅ Автоматическая рассылка в группы
 ✅ Настройка интервала между сообщениями
-✅ Защита от блокировки (умные паузы)
 
 <b>Как начать:</b>
 1️⃣ Активируйте лицензию
@@ -226,41 +270,46 @@ async def process_license_key(message: types.Message, state: FSMContext):
     license_key = message.text.strip()
     db = SessionLocal()
     
-    license_obj = db.query(LicenseKey).filter_by(key=license_key).first()
-    
-    if not license_obj:
-        await message.answer("❌ Неверный лицензионный ключ. Попробуйте снова.")
-        return
-    
-    if license_obj.is_used:
-        await message.answer("❌ Этот ключ уже был использован.")
+    try:
+        license_obj = db.query(LicenseKey).filter_by(key=license_key).first()
+        
+        if not license_obj:
+            await message.answer("❌ Неверный лицензионный ключ. Попробуйте снова.")
+            return
+        
+        if license_obj.is_used:
+            await message.answer("❌ Этот ключ уже был использован.")
+            return
+        
+        user = db.query(User).filter_by(user_id=message.from_user.id).first()
+        
+        if not user:
+            await message.answer("❌ Пользователь не найден. Нажмите /start")
+            return
+        
+        if license_obj.duration_days == -1:
+            expiry = datetime.utcnow() + timedelta(days=36500)  # ~100 лет
+        else:
+            expiry = datetime.utcnow() + timedelta(days=license_obj.duration_days)
+        
+        user.license_key = license_key
+        user.license_expiry = expiry
+        
+        license_obj.is_used = True
+        license_obj.used_by = user.user_id
+        
+        db.commit()
+        
+        await message.answer(
+            f"✅ <b>Лицензия активирована!</b>\n\n"
+            f"📅 Действует до: <b>{expiry.strftime('%d.%m.%Y')}</b>\n"
+            f"🔑 Ключ: <code>{license_key}</code>",
+            reply_markup=get_main_keyboard(message.from_user.id)
+        )
+        
+        await state.finish()
+    finally:
         db.close()
-        return
-    
-    user = db.query(User).filter_by(user_id=message.from_user.id).first()
-    
-    if license_obj.duration_days == -1:
-        expiry = datetime.utcnow() + timedelta(days=36500)  # ~100 лет
-    else:
-        expiry = datetime.utcnow() + timedelta(days=license_obj.duration_days)
-    
-    user.license_key = license_key
-    user.license_expiry = expiry
-    
-    license_obj.is_used = True
-    license_obj.used_by = user.user_id
-    
-    db.commit()
-    db.close()
-    
-    await message.answer(
-        f"✅ <b>Лицензия активирована!</b>\n\n"
-        f"📅 Действует до: <b>{expiry.strftime('%d.%m.%Y')}</b>\n"
-        f"🔑 Ключ: <code>{license_key}</code>",
-        reply_markup=get_main_keyboard(message.from_user.id)
-    )
-    
-    await state.finish()
 
 @dp.callback_query_handler(lambda c: c.data == 'connect_account')
 async def process_connect_account(callback_query: types.CallbackQuery):
@@ -287,7 +336,6 @@ async def process_phone(message: types.Message, state: FSMContext):
     
     await state.update_data(phone=phone)
     
-    # Create Pyrogram client
     client = Client(
         f"session_{message.from_user.id}",
         api_id=API_ID,
@@ -328,17 +376,18 @@ async def process_code(message: types.Message, state: FSMContext):
         await client.connect()
         await client.sign_in(phone, phone_code_hash, code)
         
-        # Save session
         session_string = await client.export_session_string()
         
         db = SessionLocal()
-        user = db.query(User).filter_by(user_id=message.from_user.id).first()
-        user.phone_number = phone
-        user.session_string = session_string
-        db.commit()
-        db.close()
+        try:
+            user = db.query(User).filter_by(user_id=message.from_user.id).first()
+            if user:
+                user.phone_number = phone
+                user.session_string = session_string
+                db.commit()
+        finally:
+            db.close()
         
-        # Store active client
         active_clients[message.from_user.id] = client
         
         await message.answer(
@@ -357,10 +406,14 @@ async def process_create_broadcast(callback_query: types.CallbackQuery):
         await bot.answer_callback_query(callback_query.id, "❌ У вас нет активной лицензии!", show_alert=True)
         return
     
-    user = get_user_by_id(callback_query.from_user.id)
-    if not user or not user.session_string:
-        await bot.answer_callback_query(callback_query.id, "❌ Сначала подключите аккаунт!", show_alert=True)
-        return
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter_by(user_id=callback_query.from_user.id).first()
+        if not user or not user.session_string:
+            await bot.answer_callback_query(callback_query.id, "❌ Сначала подключите аккаунт!", show_alert=True)
+            return
+    finally:
+        db.close()
     
     await bot.answer_callback_query(callback_query.id)
     await bot.send_message(
@@ -373,7 +426,6 @@ async def process_create_broadcast(callback_query: types.CallbackQuery):
 @dp.message_handler(state=UserStates.waiting_message)
 async def process_message_text(message: types.Message, state: FSMContext):
     message_text = message.text
-    
     await state.update_data(message_text=message_text)
     
     await message.answer(
@@ -394,20 +446,22 @@ async def process_interval(message: types.Message, state: FSMContext):
         data = await state.get_data()
         message_text = data.get('message_text')
         
-        # Save task to database
         db = SessionLocal()
-        task = BroadcastTask(
-            user_id=message.from_user.id,
-            message_text=message_text,
-            interval_minutes=interval,
-            status='active'
-        )
-        db.add(task)
-        db.commit()
-        db.close()
+        try:
+            task = BroadcastTask(
+                user_id=message.from_user.id,
+                message_text=message_text,
+                interval_minutes=interval,
+                status='active'
+            )
+            db.add(task)
+            db.commit()
+            db.refresh(task)
+            task_id = task.id
+        finally:
+            db.close()
         
-        # Start broadcast task
-        asyncio.create_task(start_broadcast(message.from_user.id, task.id))
+        asyncio.create_task(start_broadcast(message.from_user.id, task_id))
         
         await message.answer(
             f"✅ <b>Рассылка создана!</b>\n\n"
@@ -426,14 +480,15 @@ async def process_interval(message: types.Message, state: FSMContext):
 async def start_broadcast(user_id: int, task_id: int):
     """Start broadcast task"""
     db = SessionLocal()
-    task = db.query(BroadcastTask).filter_by(id=task_id).first()
-    user = db.query(User).filter_by(user_id=user_id).first()
-    db.close()
+    try:
+        task = db.query(BroadcastTask).filter_by(id=task_id).first()
+        user = db.query(User).filter_by(user_id=user_id).first()
+    finally:
+        db.close()
     
     if not task or not user or not user.session_string:
         return
     
-    # Create client from session
     client = Client(
         f"broadcast_{user_id}",
         api_id=API_ID,
@@ -444,70 +499,74 @@ async def start_broadcast(user_id: int, task_id: int):
     try:
         await client.start()
         
-        # Get all dialogs (groups)
         dialogs = []
         async for dialog in client.get_dialogs():
             if dialog.chat.type in ['group', 'supergroup']:
                 dialogs.append(dialog.chat.id)
         
-        task.groups_count = len(dialogs)
         db = SessionLocal()
-        db.query(BroadcastTask).filter_by(id=task_id).update({'groups_count': len(dialogs)})
-        db.commit()
-        db.close()
+        try:
+            db.query(BroadcastTask).filter_by(id=task_id).update({'groups_count': len(dialogs)})
+            db.commit()
+        finally:
+            db.close()
         
-        # Send messages
         for group_id in dialogs:
-            if task.status != 'active':
+            db = SessionLocal()
+            try:
+                current_task = db.query(BroadcastTask).filter_by(id=task_id).first()
+            finally:
+                db.close()
+            
+            if not current_task or current_task.status != 'active':
                 break
             
             try:
                 await client.send_message(group_id, task.message_text)
-                logger.info(f"Message sent to group {group_id} for user {user_id}")
+                logger.info(f"Message sent to group {group_id}")
                 
-                # Wait interval
                 await asyncio.sleep(task.interval_minutes * 60)
                 
             except FloodWait as e:
-                logger.warning(f"FloodWait: waiting {e.value} seconds")
+                logger.warning(f"FloodWait: {e.value} seconds")
                 await asyncio.sleep(e.value)
             except Exception as e:
-                logger.error(f"Error sending to {group_id}: {str(e)}")
+                logger.error(f"Error: {str(e)}")
                 continue
         
-        # Task completed
         db = SessionLocal()
-        db.query(BroadcastTask).filter_by(id=task_id).update({'status': 'completed'})
-        db.commit()
-        db.close()
+        try:
+            db.query(BroadcastTask).filter_by(id=task_id).update({'status': 'completed'})
+            db.commit()
+        finally:
+            db.close()
         
-        # Notify user
-        await bot.send_message(
-            user_id,
-            f"✅ <b>Рассылка завершена!</b>\n\n"
-            f"📊 Отправлено в {len(dialogs)} групп"
-        )
+        await bot.send_message(user_id, f"✅ Рассылка завершена! Отправлено в {len(dialogs)} групп")
         
     except Exception as e:
         logger.error(f"Broadcast error: {str(e)}")
-        await bot.send_message(user_id, f"❌ Ошибка рассылки: {str(e)}")
+        await bot.send_message(user_id, f"❌ Ошибка: {str(e)}")
     finally:
         await client.stop()
 
 @dp.callback_query_handler(lambda c: c.data == 'stop_broadcasts')
 async def process_stop_broadcasts(callback_query: types.CallbackQuery):
     db = SessionLocal()
-    db.query(BroadcastTask).filter_by(user_id=callback_query.from_user.id, status='active').update({'status': 'paused'})
-    db.commit()
-    db.close()
+    try:
+        db.query(BroadcastTask).filter_by(user_id=callback_query.from_user.id, status='active').update({'status': 'paused'})
+        db.commit()
+    finally:
+        db.close()
     
-    await bot.answer_callback_query(callback_query.id, "✅ Все рассылки остановлены", show_alert=True)
+    await bot.answer_callback_query(callback_query.id, "✅ Рассылки остановлены", show_alert=True)
 
 @dp.callback_query_handler(lambda c: c.data == 'my_broadcasts')
 async def process_my_broadcasts(callback_query: types.CallbackQuery):
     db = SessionLocal()
-    tasks = db.query(BroadcastTask).filter_by(user_id=callback_query.from_user.id).order_by(BroadcastTask.created_at.desc()).limit(10).all()
-    db.close()
+    try:
+        tasks = db.query(BroadcastTask).filter_by(user_id=callback_query.from_user.id).order_by(BroadcastTask.created_at.desc()).limit(10).all()
+    finally:
+        db.close()
     
     if not tasks:
         await bot.answer_callback_query(callback_query.id, "У вас нет рассылок", show_alert=True)
@@ -516,11 +575,9 @@ async def process_my_broadcasts(callback_query: types.CallbackQuery):
     text = "📊 <b>Ваши рассылки:</b>\n\n"
     for task in tasks:
         status_emoji = "✅" if task.status == 'completed' else "🔄" if task.status == 'active' else "⏸"
-        text += f"{status_emoji} <b>ID:</b> {task.id}\n"
+        text += f"{status_emoji} ID: {task.id}\n"
         text += f"📝 {task.message_text[:50]}...\n"
-        text += f"⏱ Интервал: {task.interval_minutes} мин\n"
-        text += f"👥 Групп: {task.groups_count}\n"
-        text += f"📅 {task.created_at.strftime('%d.%m.%Y')}\n\n"
+        text += f"⏱ {task.interval_minutes} мин\n\n"
     
     await bot.send_message(callback_query.from_user.id, text)
 
@@ -531,11 +588,7 @@ async def cmd_admin(message: types.Message):
         await message.answer("⛔️ У вас нет доступа к админ-панели.")
         return
     
-    await message.answer(
-        "🔐 <b>Админ-панель</b>\n\n"
-        "Выберите действие:",
-        reply_markup=get_admin_keyboard()
-    )
+    await message.answer("🔐 <b>Админ-панель</b>", reply_markup=get_admin_keyboard())
 
 @dp.callback_query_handler(lambda c: c.data == 'admin_create_key')
 async def process_admin_create_key(callback_query: types.CallbackQuery):
@@ -545,44 +598,35 @@ async def process_admin_create_key(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     await bot.send_message(
         callback_query.from_user.id,
-        "🔑 <b>Создание лицензионного ключа</b>\n\n"
-        "Введите срок действия в днях:\n"
+        "🔑 Введите срок действия в днях:\n"
         "• Число (например 30)\n"
-        "• <code>-1</code> для бессрочного ключа"
+        "• -1 для бессрочного"
     )
-    
-    # Create temporary state for admin
-    # Using a simple approach
     await dp.current_state(user=callback_query.from_user.id).set_state('admin_create_key')
 
 @dp.message_handler(lambda message: message.from_user.id == ADMIN_ID and dp.current_state(user=message.from_user.id).get_state() == 'admin_create_key')
 async def process_admin_key_duration(message: types.Message, state: FSMContext):
     try:
         duration = int(message.text)
-        
         key = generate_license_key(duration)
         
         db = SessionLocal()
-        license_obj = LicenseKey(
-            key=key,
-            duration_days=duration
-        )
-        db.add(license_obj)
-        db.commit()
-        db.close()
+        try:
+            license_obj = LicenseKey(key=key, duration_days=duration)
+            db.add(license_obj)
+            db.commit()
+        finally:
+            db.close()
         
         duration_text = "Бессрочная" if duration == -1 else f"{duration} дней"
-        
         await message.answer(
-            f"✅ <b>Ключ создан!</b>\n\n"
-            f"🔑 Ключ: <code>{key}</code>\n"
+            f"✅ Ключ создан:\n"
+            f"🔑 <code>{key}</code>\n"
             f"📅 Срок: {duration_text}"
         )
-        
         await state.finish()
-        
     except ValueError:
-        await message.answer("❌ Введите число или -1 для бессрочного ключа.")
+        await message.answer("❌ Введите число или -1")
 
 @dp.callback_query_handler(lambda c: c.data == 'admin_users')
 async def process_admin_users(callback_query: types.CallbackQuery):
@@ -590,30 +634,25 @@ async def process_admin_users(callback_query: types.CallbackQuery):
         return
     
     db = SessionLocal()
-    users = db.query(User).all()
-    db.close()
+    try:
+        users = db.query(User).all()
+    finally:
+        db.close()
     
     if not users:
         await bot.answer_callback_query(callback_query.id, "Нет пользователей", show_alert=True)
         return
     
-    text = "👥 <b>Список пользователей:</b>\n\n"
+    text = "👥 <b>Пользователи:</b>\n\n"
     for user in users:
         status = "🚫" if user.is_blocked else "✅"
         license_status = "✅" if user.license_expiry and user.license_expiry > datetime.utcnow() else "❌"
-        
-        text += f"{status} <b>ID:</b> {user.user_id}\n"
+        text += f"{status} ID: {user.user_id}\n"
         text += f"👤 {user.first_name or 'Нет имени'}"
         if user.username:
             text += f" (@{user.username})"
-        text += f"\n🔑 Лицензия: {license_status}\n"
-        
-        if user.license_expiry:
-            text += f"📅 До: {user.license_expiry.strftime('%d.%m.%Y')}\n"
-        
-        text += "\n"
+        text += f"\n🔑 {license_status}\n\n"
     
-    # Split message if too long
     if len(text) > 4000:
         parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
         for part in parts:
@@ -627,25 +666,23 @@ async def process_admin_stats(callback_query: types.CallbackQuery):
         return
     
     db = SessionLocal()
-    total_users = db.query(User).count()
-    active_licenses = db.query(User).filter(User.license_expiry > datetime.utcnow()).count()
-    total_keys = db.query(LicenseKey).count()
-    used_keys = db.query(LicenseKey).filter_by(is_used=True).count()
-    total_broadcasts = db.query(BroadcastTask).count()
-    active_broadcasts = db.query(BroadcastTask).filter_by(status='active').count()
-    db.close()
+    try:
+        total_users = db.query(User).count()
+        active_licenses = db.query(User).filter(User.license_expiry > datetime.utcnow()).count()
+        total_keys = db.query(LicenseKey).count()
+        used_keys = db.query(LicenseKey).filter_by(is_used=True).count()
+        total_broadcasts = db.query(BroadcastTask).count()
+    finally:
+        db.close()
     
     stats_text = f"""
 📊 <b>Статистика:</b>
 
-👥 Всего пользователей: <b>{total_users}</b>
+👥 Пользователей: <b>{total_users}</b>
 ✅ Активных лицензий: <b>{active_licenses}</b>
-
 🔑 Всего ключей: <b>{total_keys}</b>
-📤 Использовано ключей: <b>{used_keys}</b>
-
-📨 Всего рассылок: <b>{total_broadcasts}</b>
-🔄 Активных рассылок: <b>{active_broadcasts}</b>
+📤 Использовано: <b>{used_keys}</b>
+📨 Рассылок: <b>{total_broadcasts}</b>
 """
     
     await bot.send_message(callback_query.from_user.id, stats_text)
@@ -656,12 +693,7 @@ async def process_admin_block_user(callback_query: types.CallbackQuery):
         return
     
     await bot.answer_callback_query(callback_query.id)
-    await bot.send_message(
-        callback_query.from_user.id,
-        "🚫 <b>Блокировка пользователя</b>\n\n"
-        "Введите ID пользователя для блокировки/разблокировки:"
-    )
-    
+    await bot.send_message(callback_query.from_user.id, "Введите ID пользователя для блокировки/разблокировки:")
     await dp.current_state(user=callback_query.from_user.id).set_state('admin_block_user')
 
 @dp.message_handler(lambda message: message.from_user.id == ADMIN_ID and dp.current_state(user=message.from_user.id).get_state() == 'admin_block_user')
@@ -670,24 +702,24 @@ async def process_admin_block_user_id(message: types.Message, state: FSMContext)
         user_id = int(message.text)
         
         db = SessionLocal()
-        user = db.query(User).filter_by(user_id=user_id).first()
+        try:
+            user = db.query(User).filter_by(user_id=user_id).first()
+            if not user:
+                await message.answer("❌ Пользователь не найден.")
+                await state.finish()
+                return
+            
+            user.is_blocked = not user.is_blocked
+            db.commit()
+            status = "заблокирован" if user.is_blocked else "разблокирован"
+        finally:
+            db.close()
         
-        if not user:
-            await message.answer("❌ Пользователь не найден.")
-            await state.finish()
-            return
-        
-        user.is_blocked = not user.is_blocked
-        db.commit()
-        db.close()
-        
-        status = "заблокирован" if user.is_blocked else "разблокирован"
         await message.answer(f"✅ Пользователь {user_id} {status}.")
-        
         await state.finish()
         
     except ValueError:
-        await message.answer("❌ Введите корректный ID пользователя.")
+        await message.answer("❌ Введите корректный ID.")
 
 # Error handler
 @dp.errors_handler()
@@ -698,24 +730,12 @@ async def errors_handler(update, error):
 # Startup
 async def on_startup(dp):
     logger.info("Bot started!")
-    await bot.send_message(ADMIN_ID, "✅ Бот запущен и готов к работе!")
-
-async def on_shutdown(dp):
-    logger.info("Bot stopped!")
-    # Close all active clients
-    for client in active_clients.values():
-        try:
-            await client.stop()
-        except:
-            pass
+    try:
+        await bot.send_message(ADMIN_ID, "✅ Бот запущен и готов к работе!")
+    except:
+        pass
 
 # Main entry point
 if __name__ == '__main__':
     from aiogram import executor
-    
-    executor.start_polling(
-        dp,
-        on_startup=on_startup,
-        on_shutdown=on_shutdown,
-        skip_updates=True
-    )
+    executor.start_polling(dp, on_startup=on_startup, skip_updates=True)
