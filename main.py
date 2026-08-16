@@ -185,6 +185,7 @@ def get_main_keyboard(user_id: int):
             InlineKeyboardButton("👤 Профиль", callback_data="menu_profile"),
             InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")
         )
+        keyboard.add(InlineKeyboardButton("⏹ Остановить все", callback_data="stop_all"))
         if user_id == ADMIN_ID:
             keyboard.add(InlineKeyboardButton("🔐 Админ-панель", callback_data="menu_admin"))
     else:
@@ -248,7 +249,19 @@ async def start_broadcast(user_id: int, task_id: int):
     if not clients:
         return
     
-    status_msg = await bot.send_message(user_id, "🚀 Запускаю...")
+    stop_keyboard = InlineKeyboardMarkup()
+    stop_keyboard.add(InlineKeyboardButton("⏹ Остановить рассылку", callback_data=f"stop_task_{task_id}"))
+    
+    status_msg = await bot.send_message(
+        user_id,
+        f"🚀 <b>Рассылка запущена!</b>\n\n"
+        f"📱 Аккаунтов: {len(clients)}\n"
+        f"📝 Текстов: {len(messages)}\n"
+        f"🛡 Режим: {'Безопасный' if task.safe_mode else 'Обычный'}\n"
+        f"⏱ Интервал: {task.interval_minutes} мин\n\n"
+        f"⏳ Начинаю...",
+        reply_markup=stop_keyboard
+    )
     
     cycle = 0
     total_sent = 0
@@ -273,6 +286,15 @@ async def start_broadcast(user_id: int, task_id: int):
                 groups = await get_user_groups(client)
                 
                 for group in groups:
+                    db = SessionLocal()
+                    try:
+                        check_task = db.query(BroadcastTask).filter_by(id=task_id).first()
+                    finally:
+                        db.close()
+                    
+                    if not check_task or check_task.status != 'active':
+                        break
+                    
                     message_text = random.choice(messages)
                     
                     try:
@@ -290,6 +312,17 @@ async def start_broadcast(user_id: int, task_id: int):
                         finally:
                             db.close()
                         
+                        try:
+                            await status_msg.edit_text(
+                                f"🔄 <b>Цикл {cycle}</b>\n\n"
+                                f"📨 Отправлено: <b>{total_sent}</b>\n"
+                                f"👥 Групп: {len(groups)}\n"
+                                f"⏳ Продолжаю...",
+                                reply_markup=stop_keyboard
+                            )
+                        except:
+                            pass
+                        
                         await asyncio.sleep(1)
                         
                     except FloodWait as e:
@@ -304,7 +337,27 @@ async def start_broadcast(user_id: int, task_id: int):
             else:
                 interval_seconds = task.interval_minutes * 60
             
-            await asyncio.sleep(interval_seconds)
+            try:
+                await status_msg.edit_text(
+                    f"✅ <b>Цикл {cycle} завершен</b>\n\n"
+                    f"📨 Всего: <b>{total_sent}</b>\n"
+                    f"⏱ Следующий через ~{interval_seconds // 60} мин",
+                    reply_markup=stop_keyboard
+                )
+            except:
+                pass
+            
+            # Ждем с проверкой каждые 5 секунд
+            for _ in range(interval_seconds // 5):
+                db = SessionLocal()
+                try:
+                    check_task = db.query(BroadcastTask).filter_by(id=task_id).first()
+                finally:
+                    db.close()
+                
+                if not check_task or check_task.status != 'active':
+                    break
+                await asyncio.sleep(5)
         
     except Exception as e:
         logger.error(f"Broadcast error: {e}")
@@ -314,6 +367,15 @@ async def start_broadcast(user_id: int, task_id: int):
                 await client.stop()
             except:
                 pass
+        
+        try:
+            await status_msg.edit_text(
+                f"⏹ <b>Рассылка остановлена</b>\n\n"
+                f"📨 Всего отправлено: <b>{total_sent}</b>\n"
+                f"🔄 Циклов: <b>{cycle}</b>"
+            )
+        except:
+            pass
 
 # Start command
 @dp.message_handler(commands=['start'])
@@ -331,6 +393,49 @@ async def back(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     await bot.edit_message_text(
         "Главное меню:",
+        callback_query.from_user.id,
+        callback_query.message.message_id,
+        reply_markup=get_main_keyboard(callback_query.from_user.id)
+    )
+
+@dp.callback_query_handler(lambda c: c.data == "stop_all")
+async def cb_stop_all(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    
+    db = SessionLocal()
+    try:
+        db.query(BroadcastTask).filter_by(
+            user_id=callback_query.from_user.id,
+            status='active'
+        ).update({'status': 'paused'})
+        db.commit()
+    finally:
+        db.close()
+    
+    await bot.edit_message_text(
+        "✅ <b>Все рассылки остановлены!</b>",
+        callback_query.from_user.id,
+        callback_query.message.message_id,
+        reply_markup=get_main_keyboard(callback_query.from_user.id)
+    )
+
+@dp.callback_query_handler(lambda c: c.data.startswith("stop_task_"))
+async def cb_stop_task(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id, "⏹ Останавливаю...")
+    
+    task_id = int(callback_query.data.split("_")[2])
+    
+    db = SessionLocal()
+    try:
+        task = db.query(BroadcastTask).filter_by(id=task_id).first()
+        if task:
+            task.status = 'paused'
+            db.commit()
+    finally:
+        db.close()
+    
+    await bot.edit_message_text(
+        "⏹ <b>Рассылка остановлена!</b>",
         callback_query.from_user.id,
         callback_query.message.message_id,
         reply_markup=get_main_keyboard(callback_query.from_user.id)
@@ -783,14 +888,14 @@ async def process_password(message: types.Message, state: FSMContext):
         await message.answer(f"❌ Ошибка: {str(e)}")
         await state.finish()
 
-# Обработчик обычного режима (один текст)
+# Обычный режим
 @dp.message_handler(state=UserStates.waiting_interval)
 async def process_text_normal(message: types.Message, state: FSMContext):
     await state.update_data(messages=[message.text.strip()])
     await message.answer("⏱ Интервал (30-120 мин):", reply_markup=get_back_keyboard())
     await UserStates.waiting_more_messages.set()
 
-# Обработчик безопасного режима (3 текста)
+# Безопасный режим
 @dp.message_handler(state=UserStates.waiting_safe_messages)
 async def process_safe_messages(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -808,7 +913,7 @@ async def process_safe_messages(message: types.Message, state: FSMContext):
         await message.answer("⏱ Интервал (30-120 мин):", reply_markup=get_back_keyboard())
         await UserStates.waiting_more_messages.set()
 
-# Финальный шаг - интервал
+# Финальный шаг
 @dp.message_handler(state=UserStates.waiting_more_messages)
 async def process_final(message: types.Message, state: FSMContext):
     try:
@@ -839,7 +944,8 @@ async def process_final(message: types.Message, state: FSMContext):
         
         await message.answer(
             f"✅ <b>Рассылка запущена!</b>\n"
-            f"⏱ Интервал: {interval} мин",
+            f"⏱ Интервал: {interval} мин\n\n"
+            f"Используйте кнопку ⏹ для остановки",
             reply_markup=get_main_keyboard(message.from_user.id)
         )
         await state.finish()
