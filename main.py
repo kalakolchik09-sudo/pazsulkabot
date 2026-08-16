@@ -120,6 +120,7 @@ class UserStates(StatesGroup):
     waiting_interval = State()
     selecting_accounts = State()
     waiting_more_messages = State()
+    waiting_safe_messages = State()
 
 # Initialize bot
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
@@ -556,9 +557,12 @@ async def cb_mode(callback_query: types.CallbackQuery, state: FSMContext):
     keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back"))
     
     if safe_mode:
-        text = "📝 Введите 3 текста через <code>|||</code>:"
+        text = "📝 <b>Безопасный режим</b>\n\nОтправьте текст №1 (из 3):"
+        await state.update_data(safe_messages=[], safe_counter=0)
+        await UserStates.waiting_safe_messages.set()
     else:
         text = "📝 Введите текст сообщения:"
+        await UserStates.waiting_interval.set()
     
     await bot.edit_message_text(
         text,
@@ -566,7 +570,6 @@ async def cb_mode(callback_query: types.CallbackQuery, state: FSMContext):
         callback_query.message.message_id,
         reply_markup=keyboard
     )
-    await UserStates.waiting_interval.set()
 
 @dp.callback_query_handler(lambda c: c.data == "menu_admin")
 async def cb_admin(callback_query: types.CallbackQuery):
@@ -780,20 +783,32 @@ async def process_password(message: types.Message, state: FSMContext):
         await message.answer(f"❌ Ошибка: {str(e)}")
         await state.finish()
 
+# Обработчик обычного режима (один текст)
 @dp.message_handler(state=UserStates.waiting_interval)
-async def process_text(message: types.Message, state: FSMContext):
-    messages = [m.strip() for m in message.text.split('|||') if m.strip()]
-    data = await state.get_data()
-    safe_mode = data.get('safe_mode', False)
-    
-    if safe_mode and len(messages) < 3:
-        await message.answer("❌ Нужно 3 текста!")
-        return
-    
-    await state.update_data(messages=messages)
+async def process_text_normal(message: types.Message, state: FSMContext):
+    await state.update_data(messages=[message.text.strip()])
     await message.answer("⏱ Интервал (30-120 мин):", reply_markup=get_back_keyboard())
     await UserStates.waiting_more_messages.set()
 
+# Обработчик безопасного режима (3 текста)
+@dp.message_handler(state=UserStates.waiting_safe_messages)
+async def process_safe_messages(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    safe_messages = data.get('safe_messages', [])
+    safe_counter = data.get('safe_counter', 0)
+    
+    safe_messages.append(message.text.strip())
+    safe_counter += 1
+    
+    if safe_counter < 3:
+        await state.update_data(safe_messages=safe_messages, safe_counter=safe_counter)
+        await message.answer(f"📝 Отправьте текст №{safe_counter + 1} (из 3):")
+    else:
+        await state.update_data(messages=safe_messages)
+        await message.answer("⏱ Интервал (30-120 мин):", reply_markup=get_back_keyboard())
+        await UserStates.waiting_more_messages.set()
+
+# Финальный шаг - интервал
 @dp.message_handler(state=UserStates.waiting_more_messages)
 async def process_final(message: types.Message, state: FSMContext):
     try:
