@@ -12,7 +12,7 @@ from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.types import ParseMode, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram import Client
 from pyrogram.errors import FloodWait, PhoneCodeExpired, PhoneCodeInvalid, SessionPasswordNeeded, PasswordHashInvalid
 from pyrogram.enums import ChatType
@@ -21,7 +21,6 @@ from pyrogram.enums import ChatType
 from sqlalchemy import create_engine, Column, Integer, BigInteger, String, DateTime, Boolean, Text, text
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import inspect
 
 # Configuration
 logging.basicConfig(level=logging.INFO)
@@ -56,16 +55,7 @@ def get_database_url():
 DATABASE_URL = get_database_url()
 
 # Create engine
-try:
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=20, max_overflow=40)
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
-    logger.info("✅ Database connected")
-except Exception as e:
-    logger.error(f"Database error: {e}")
-    DATABASE_URL = 'sqlite:///bot.db'
-    engine = create_engine(DATABASE_URL)
-
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=20, max_overflow=40)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 Base = declarative_base()
 
@@ -113,9 +103,7 @@ class BroadcastTask(Base):
     sent_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# Create tables
 Base.metadata.create_all(engine)
-logger.info("✅ Tables ready")
 
 # States
 class UserStates(StatesGroup):
@@ -176,80 +164,48 @@ def create_user_if_not_exists(user_id: int, username: str = None, first_name: st
         user = db.query(User).filter_by(user_id=user_id).first()
         if not user:
             user = User(user_id=user_id, username=username, first_name=first_name)
-            if user_id == ADMIN_ID:
-                user.max_accounts = 999999
-            else:
-                user.max_accounts = 3
+            user.max_accounts = 999999 if user_id == ADMIN_ID else 3
             db.add(user)
             db.commit()
         return user
     finally:
         db.close()
 
-def get_back_keyboard():
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add(KeyboardButton("🔙 Назад"))
-    return keyboard
-
-# Keyboards
+# Inline Keyboards
 def get_main_keyboard(user_id: int):
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    
-    if user_id == ADMIN_ID:
-        keyboard.insert(KeyboardButton("🔐 Админ-панель"))
+    keyboard = InlineKeyboardMarkup(row_width=2)
     
     if is_valid_license(user_id):
         keyboard.add(
-            KeyboardButton("📱 Аккаунты"),
-            KeyboardButton("📨 Рассылка")
+            InlineKeyboardButton("📱 Аккаунты", callback_data="menu_accounts"),
+            InlineKeyboardButton("📨 Рассылка", callback_data="menu_broadcast")
         )
         keyboard.add(
-            KeyboardButton("👤 Профиль"),
-            KeyboardButton("📊 Статистика")
+            InlineKeyboardButton("👤 Профиль", callback_data="menu_profile"),
+            InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")
         )
+        if user_id == ADMIN_ID:
+            keyboard.add(InlineKeyboardButton("🔐 Админ-панель", callback_data="menu_admin"))
     else:
-        keyboard.add(KeyboardButton("🔑 Активировать лицензию"))
-        keyboard.add(KeyboardButton("👤 Профиль"))
+        keyboard.add(InlineKeyboardButton("🔑 Активировать лицензию", callback_data="menu_license"))
+        keyboard.add(InlineKeyboardButton("👤 Профиль", callback_data="menu_profile"))
     
     return keyboard
 
-def get_accounts_keyboard():
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add(
-        KeyboardButton("➕ Добавить аккаунт"),
-        KeyboardButton("📋 Мои аккаунты")
-    )
-    keyboard.add(KeyboardButton("🔙 Назад"))
-    return keyboard
-
-def get_admin_keyboard():
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    keyboard.add(
-        KeyboardButton("🔑 Создать ключ"),
-        KeyboardButton("👥 Пользователи")
-    )
-    keyboard.add(
-        KeyboardButton("⚙️ Лимиты аккаунтов"),
-        KeyboardButton("📢 Рассылка всем")
-    )
-    keyboard.add(KeyboardButton("📊 Статистика"), KeyboardButton("🚫 Блокировка"))
-    keyboard.add(KeyboardButton("🔙 Назад"))
+def get_back_keyboard():
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back"))
     return keyboard
 
 # Функция получения групп
 async def get_user_groups(client: Client):
     groups = []
     try:
-        dialogs = []
         async for dialog in client.get_dialogs(limit=None):
-            dialogs.append(dialog)
-        
-        for dialog in dialogs:
-            chat = dialog.chat
-            if chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
+            if dialog.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
                 groups.append({
-                    'id': chat.id,
-                    'title': chat.title or 'Без названия'
+                    'id': dialog.chat.id,
+                    'title': dialog.chat.title or 'Без названия'
                 })
     except Exception as e:
         logger.error(f"Error getting groups: {e}")
@@ -291,7 +247,7 @@ async def start_broadcast(user_id: int, task_id: int):
     if not clients:
         return
     
-    status_msg = await bot.send_message(user_id, "🚀 Запускаю рассылку...")
+    status_msg = await bot.send_message(user_id, "🚀 Запускаю...")
     
     cycle = 0
     total_sent = 0
@@ -333,15 +289,6 @@ async def start_broadcast(user_id: int, task_id: int):
                         finally:
                             db.close()
                         
-                        try:
-                            await status_msg.edit_text(
-                                f"🔄 <b>Цикл {cycle}</b>\n"
-                                f"📨 Отправлено: <b>{total_sent}</b>\n"
-                                f"⏳ Продолжаю..."
-                            )
-                        except:
-                            pass
-                        
                         await asyncio.sleep(1)
                         
                     except FloodWait as e:
@@ -352,26 +299,14 @@ async def start_broadcast(user_id: int, task_id: int):
             if task.safe_mode:
                 base = task.interval_minutes * 60
                 variation = int(base * 0.2)
-                interval_seconds = base + random.randint(-variation, variation)
-                # Ограничиваем от 30 до 120 минут
-                interval_seconds = max(1800, min(7200, interval_seconds))
+                interval_seconds = max(1800, min(7200, base + random.randint(-variation, variation)))
             else:
                 interval_seconds = task.interval_minutes * 60
-            
-            try:
-                await status_msg.edit_text(
-                    f"✅ <b>Цикл {cycle} завершен</b>\n"
-                    f"📨 Всего: <b>{total_sent}</b>\n"
-                    f"⏱ Следующий через ~{interval_seconds // 60} мин"
-                )
-            except:
-                pass
             
             await asyncio.sleep(interval_seconds)
         
     except Exception as e:
         logger.error(f"Broadcast error: {e}")
-        await bot.send_message(user_id, f"❌ Ошибка: {str(e)}")
     finally:
         for client in clients:
             try:
@@ -379,340 +314,346 @@ async def start_broadcast(user_id: int, task_id: int):
             except:
                 pass
 
-# User handlers
+# Start command
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     create_user_if_not_exists(message.from_user.id, message.from_user.username, message.from_user.first_name)
     await message.answer(
         f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
-        f"Я бот для рассылки сообщений в группы.\n"
         f"Выберите действие:",
         reply_markup=get_main_keyboard(message.from_user.id)
     )
 
-@dp.message_handler(lambda message: message.text == "🔙 Назад")
-async def go_back(message: types.Message):
-    await message.answer("Главное меню:", reply_markup=get_main_keyboard(message.from_user.id))
+# Callback handlers
+@dp.callback_query_handler(lambda c: c.data == "back")
+async def back(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    await bot.edit_message_text(
+        "Главное меню:",
+        callback_query.from_user.id,
+        callback_query.message.message_id,
+        reply_markup=get_main_keyboard(callback_query.from_user.id)
+    )
 
-# Профиль
-@dp.message_handler(lambda message: message.text == "👤 Профиль")
-async def show_profile(message: types.Message):
+@dp.callback_query_handler(lambda c: c.data == "menu_profile")
+async def cb_profile(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
     db = SessionLocal()
     try:
-        user = db.query(User).filter_by(user_id=message.from_user.id).first()
+        user = db.query(User).filter_by(user_id=callback_query.from_user.id).first()
         if not user:
-            await message.answer("❌ Профиль не найден.")
             return
         
-        accounts = db.query(Account).filter_by(user_id=message.from_user.id).all()
-        total_broadcasts = db.query(BroadcastTask).filter_by(user_id=message.from_user.id).count()
-        active_broadcasts = db.query(BroadcastTask).filter_by(user_id=message.from_user.id, status='active').count()
+        accounts = db.query(Account).filter_by(user_id=callback_query.from_user.id).all()
+        total_broadcasts = db.query(BroadcastTask).filter_by(user_id=callback_query.from_user.id).count()
         
         if user.user_id == ADMIN_ID:
-            license_status = "👑 <b>Администратор</b>\n♾ Бессрочная"
+            license_status = "👑 <b>Администратор</b>"
         elif user.license_expiry and user.license_expiry > datetime.utcnow():
             days_left = (user.license_expiry - datetime.utcnow()).days
-            license_status = f"✅ <b>Активна</b>\n📅 До: <b>{user.license_expiry.strftime('%d.%m.%Y')}</b>\n⏳ Осталось: <b>{days_left} дн.</b>"
+            license_status = f"✅ <b>Активна</b> (до {user.license_expiry.strftime('%d.%m.%Y')})"
         else:
             license_status = "❌ <b>Не активирована</b>"
         
-        profile_text = f"""
-╭━━━━━━━━━━━━━━━╮
-┃   👤 <b>ПРОФИЛЬ</b>   ┃
-╰━━━━━━━━━━━━━━━╯
+        text = f"""
+👤 <b>ПРОФИЛЬ</b>
 
-🆔 <b>ID:</b> <code>{user.user_id}</code>
-👤 <b>Имя:</b> {user.first_name or '—'}
-{f"🔗 <b>Username:</b> @{user.username}" if user.username else ""}
+🆔 ID: <code>{user.user_id}</code>
+👤 Имя: {user.first_name or '—'}
 
-━━━━━━━━━━━━━━━
+💳 Подписка: {license_status}
 
-💳 <b>Подписка</b>
-{license_status}
+📱 Аккаунты: <b>{len(accounts)}</b> / {'♾' if user.max_accounts >= 999999 else user.max_accounts}
 
-━━━━━━━━━━━━━━━
-
-📱 <b>Аккаунты</b>
-Подключено: <b>{len(accounts)}</b>
-Лимит: <b>{'♾' if user.max_accounts >= 999999 else user.max_accounts}</b>
-
-"""
-        if accounts:
-            profile_text += "<b>Список:</b>\n"
-            for i, acc in enumerate(accounts, 1):
-                profile_text += f"  {i}. <code>{acc.phone_number or '—'}</code>\n"
-        
-        profile_text += f"""
-━━━━━━━━━━━━━━━
-
-📊 <b>Статистика</b>
-📨 Рассылок: <b>{total_broadcasts}</b>
-🔄 Активных: <b>{active_broadcasts}</b>
-
-━━━━━━━━━━━━━━━
-
-📅 <b>Регистрация:</b> {user.created_at.strftime('%d.%m.%Y')}
+📊 Рассылок: <b>{total_broadcasts}</b>
 """
         
-        await message.answer(profile_text, reply_markup=get_main_keyboard(message.from_user.id))
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back"))
+        
+        await bot.edit_message_text(
+            text,
+            callback_query.from_user.id,
+            callback_query.message.message_id,
+            reply_markup=keyboard
+        )
     finally:
         db.close()
 
-# Аккаунты
-@dp.message_handler(lambda message: message.text == "📱 Аккаунты")
-async def accounts_menu(message: types.Message):
-    if not is_valid_license(message.from_user.id):
-        await message.answer("❌ Нет активной лицензии!")
-        return
-    
-    await message.answer("📱 <b>Управление аккаунтами</b>", reply_markup=get_accounts_keyboard())
+@dp.callback_query_handler(lambda c: c.data == "menu_stats")
+async def cb_stats(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    db = SessionLocal()
+    try:
+        total_users = db.query(User).count()
+        total_accounts = db.query(Account).count()
+        total_broadcasts = db.query(BroadcastTask).count()
+        
+        text = f"""
+📊 <b>СТАТИСТИКА</b>
 
-@dp.message_handler(lambda message: message.text == "➕ Добавить аккаунт")
-async def add_account(message: types.Message):
-    if not is_valid_license(message.from_user.id):
-        await message.answer("❌ Нет активной лицензии!")
-        return
+👥 Пользователей: <b>{total_users}</b>
+📱 Аккаунтов: <b>{total_accounts}</b>
+📨 Рассылок: <b>{total_broadcasts}</b>
+"""
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back"))
+        
+        await bot.edit_message_text(
+            text,
+            callback_query.from_user.id,
+            callback_query.message.message_id,
+            reply_markup=keyboard
+        )
+    finally:
+        db.close()
+
+@dp.callback_query_handler(lambda c: c.data == "menu_license")
+async def cb_license(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back"))
+    await bot.edit_message_text(
+        "🔑 Введите лицензионный ключ:",
+        callback_query.from_user.id,
+        callback_query.message.message_id,
+        reply_markup=keyboard
+    )
+    await UserStates.waiting_license.set()
+
+@dp.callback_query_handler(lambda c: c.data == "menu_accounts")
+async def cb_accounts(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("➕ Добавить", callback_data="acc_add"),
+        InlineKeyboardButton("📋 Список", callback_data="acc_list")
+    )
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back"))
+    
+    await bot.edit_message_text(
+        "📱 <b>Аккаунты</b>",
+        callback_query.from_user.id,
+        callback_query.message.message_id,
+        reply_markup=keyboard
+    )
+
+@dp.callback_query_handler(lambda c: c.data == "acc_add")
+async def cb_acc_add(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
     
     db = SessionLocal()
     try:
-        user = db.query(User).filter_by(user_id=message.from_user.id).first()
-        accounts_count = db.query(Account).filter_by(user_id=message.from_user.id).count()
+        user = db.query(User).filter_by(user_id=callback_query.from_user.id).first()
+        count = db.query(Account).filter_by(user_id=callback_query.from_user.id).count()
         
-        if accounts_count >= user.max_accounts:
-            await message.answer(f"❌ Лимит аккаунтов исчерпан ({user.max_accounts})!")
+        if count >= user.max_accounts:
+            await bot.answer_callback_query(callback_query.id, f"Лимит: {user.max_accounts}", show_alert=True)
             return
     finally:
         db.close()
     
-    await message.answer("📱 Введите номер:\n<code>+380123456789</code>", reply_markup=get_back_keyboard())
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back"))
+    await bot.edit_message_text(
+        "📱 Введите номер:\n<code>+380123456789</code>",
+        callback_query.from_user.id,
+        callback_query.message.message_id,
+        reply_markup=keyboard
+    )
     await UserStates.waiting_phone.set()
 
-@dp.message_handler(lambda message: message.text == "📋 Мои аккаунты")
-async def my_accounts_list(message: types.Message):
+@dp.callback_query_handler(lambda c: c.data == "acc_list")
+async def cb_acc_list(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
     db = SessionLocal()
     try:
-        accounts = db.query(Account).filter_by(user_id=message.from_user.id).all()
+        accounts = db.query(Account).filter_by(user_id=callback_query.from_user.id).all()
     finally:
         db.close()
     
     if not accounts:
-        await message.answer("❌ Нет подключенных аккаунтов.")
-        return
-    
-    text = "📋 <b>Ваши аккаунты:</b>\n\n"
-    for i, acc in enumerate(accounts, 1):
-        text += f"{i}. <code>{acc.phone_number or '—'}</code> (ID: {acc.id})\n"
-    
-    await message.answer(text)
-
-# Рассылка
-@dp.message_handler(lambda message: message.text == "📨 Рассылка")
-async def broadcast_menu(message: types.Message):
-    if not is_valid_license(message.from_user.id):
-        await message.answer("❌ Нет активной лицензии!")
-        return
-    
-    db = SessionLocal()
-    try:
-        accounts = db.query(Account).filter_by(user_id=message.from_user.id).all()
-    finally:
-        db.close()
-    
-    if not accounts:
-        await message.answer("❌ Сначала добавьте аккаунт!")
-        return
-    
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    for acc in accounts:
-        keyboard.add(KeyboardButton(f"📱 {acc.phone_number}"))
-    keyboard.add(KeyboardButton("✅ Все аккаунты"))
-    keyboard.add(KeyboardButton("🔙 Назад"))
-    
-    await message.answer("📱 Выберите аккаунт(ы):", reply_markup=keyboard)
-    await UserStates.selecting_accounts.set()
-
-@dp.message_handler(state=UserStates.selecting_accounts)
-async def process_account_selection(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад":
-        await state.finish()
-        await message.answer("Главное меню:", reply_markup=get_main_keyboard(message.from_user.id))
-        return
-    
-    db = SessionLocal()
-    try:
-        accounts = db.query(Account).filter_by(user_id=message.from_user.id).all()
-    finally:
-        db.close()
-    
-    selected_ids = []
-    
-    if message.text == "✅ Все аккаунты":
-        selected_ids = [acc.id for acc in accounts]
+        text = "❌ Нет аккаунтов."
     else:
-        for acc in accounts:
-            if message.text == f"📱 {acc.phone_number}":
-                selected_ids = [acc.id]
-                break
+        text = "📋 <b>Ваши аккаунты:</b>\n\n"
+        for i, acc in enumerate(accounts, 1):
+            text += f"{i}. <code>{acc.phone_number or '—'}</code>\n"
     
-    if not selected_ids:
-        await message.answer("❌ Выберите из списка.")
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back"))
+    
+    await bot.edit_message_text(
+        text,
+        callback_query.from_user.id,
+        callback_query.message.message_id,
+        reply_markup=keyboard
+    )
+
+@dp.callback_query_handler(lambda c: c.data == "menu_broadcast")
+async def cb_broadcast(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    
+    db = SessionLocal()
+    try:
+        accounts = db.query(Account).filter_by(user_id=callback_query.from_user.id).all()
+    finally:
+        db.close()
+    
+    if not accounts:
+        await bot.answer_callback_query(callback_query.id, "Сначала добавьте аккаунт!", show_alert=True)
         return
+    
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    for acc in accounts:
+        keyboard.add(InlineKeyboardButton(f"📱 {acc.phone_number}", callback_data=f"sel_acc_{acc.id}"))
+    keyboard.add(InlineKeyboardButton("✅ Все аккаунты", callback_data="sel_acc_all"))
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back"))
+    
+    await bot.edit_message_text(
+        "📱 Выберите аккаунт:",
+        callback_query.from_user.id,
+        callback_query.message.message_id,
+        reply_markup=keyboard
+    )
+
+@dp.callback_query_handler(lambda c: c.data.startswith("sel_acc_"))
+async def cb_select_account(callback_query: types.CallbackQuery, state: FSMContext):
+    await bot.answer_callback_query(callback_query.id)
+    
+    if callback_query.data == "sel_acc_all":
+        db = SessionLocal()
+        try:
+            accounts = db.query(Account).filter_by(user_id=callback_query.from_user.id).all()
+            selected_ids = [acc.id for acc in accounts]
+        finally:
+            db.close()
+    else:
+        acc_id = int(callback_query.data.split("_")[2])
+        selected_ids = [acc_id]
     
     await state.update_data(account_ids=selected_ids)
     
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add(KeyboardButton("🛡 Безопасный режим"), KeyboardButton("⚡ Обычный режим"))
-    keyboard.add(KeyboardButton("🔙 Назад"))
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton("🛡 Безопасный режим", callback_data="mode_safe"))
+    keyboard.add(InlineKeyboardButton("⚡ Обычный режим", callback_data="mode_normal"))
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back"))
     
-    await message.answer("🛡 Выберите режим:", reply_markup=keyboard)
-    await UserStates.waiting_message.set()
+    await bot.edit_message_text(
+        "🛡 Выберите режим:",
+        callback_query.from_user.id,
+        callback_query.message.message_id,
+        reply_markup=keyboard
+    )
 
-@dp.message_handler(state=UserStates.waiting_message)
-async def process_mode(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад":
-        await state.finish()
-        await message.answer("Главное меню:", reply_markup=get_main_keyboard(message.from_user.id))
-        return
+@dp.callback_query_handler(lambda c: c.data.startswith("mode_"))
+async def cb_mode(callback_query: types.CallbackQuery, state: FSMContext):
+    await bot.answer_callback_query(callback_query.id)
     
-    safe_mode = message.text == "🛡 Безопасный режим"
+    safe_mode = callback_query.data == "mode_safe"
     await state.update_data(safe_mode=safe_mode)
     
-    if safe_mode:
-        await message.answer(
-            "📝 Введите 3 текста через разделитель <code>|||</code>:\n"
-            "<code>Текст1|||Текст2|||Текст3</code>",
-            reply_markup=get_back_keyboard()
-        )
-    else:
-        await message.answer("📝 Введите текст сообщения:", reply_markup=get_back_keyboard())
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back"))
     
+    if safe_mode:
+        text = "📝 Введите 3 текста через <code>|||</code>:"
+    else:
+        text = "📝 Введите текст сообщения:"
+    
+    await bot.edit_message_text(
+        text,
+        callback_query.from_user.id,
+        callback_query.message.message_id,
+        reply_markup=keyboard
+    )
     await UserStates.waiting_interval.set()
 
-@dp.message_handler(state=UserStates.waiting_interval)
-async def process_text(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад":
-        await state.finish()
-        await message.answer("Главное меню:", reply_markup=get_main_keyboard(message.from_user.id))
+@dp.callback_query_handler(lambda c: c.data == "menu_admin")
+async def cb_admin(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    
+    if callback_query.from_user.id != ADMIN_ID:
         return
     
-    messages = [m.strip() for m in message.text.split('|||') if m.strip()]
-    data = await state.get_data()
-    safe_mode = data.get('safe_mode', False)
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("🔑 Создать ключ", callback_data="adm_key"),
+        InlineKeyboardButton("📢 Рассылка всем", callback_data="adm_broadcast")
+    )
+    keyboard.add(
+        InlineKeyboardButton("⚙️ Лимиты", callback_data="adm_limits"),
+        InlineKeyboardButton("📊 Статистика", callback_data="menu_stats")
+    )
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back"))
     
-    if safe_mode and len(messages) < 3:
-        await message.answer("❌ Нужно минимум 3 текста для безопасного режима!")
-        return
-    
-    await state.update_data(messages=messages)
-    await message.answer("⏱ Введите интервал в минутах (30-120):", reply_markup=get_back_keyboard())
-    await UserStates.waiting_more_messages.set()
+    await bot.edit_message_text(
+        "🔐 <b>Админ-панель</b>",
+        callback_query.from_user.id,
+        callback_query.message.message_id,
+        reply_markup=keyboard
+    )
 
-@dp.message_handler(state=UserStates.waiting_more_messages)
-async def process_final(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад":
-        await state.finish()
-        await message.answer("Главное меню:", reply_markup=get_main_keyboard(message.from_user.id))
-        return
-    
+@dp.callback_query_handler(lambda c: c.data == "adm_key")
+async def cb_adm_key(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back"))
+    await bot.edit_message_text(
+        "🔑 Введите срок (дней, -1 = бессрочно):",
+        callback_query.from_user.id,
+        callback_query.message.message_id,
+        reply_markup=keyboard
+    )
+    await UserStates.admin_create_key.set()
+
+@dp.callback_query_handler(lambda c: c.data == "adm_broadcast")
+async def cb_adm_broadcast(callback_query: types.CallbackQuery):
+    await bot.answer_callback_query(callback_query.id)
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back"))
+    await bot.edit_message_text(
+        "📝 Введите текст для рассылки:",
+        callback_query.from_user.id,
+        callback_query.message.message_id,
+        reply_markup=keyboard
+    )
+    await UserStates.admin_broadcast.set()
+
+# Message handlers
+@dp.message_handler(state=UserStates.waiting_license)
+async def process_license(message: types.Message, state: FSMContext):
+    key = message.text.strip()
+    db = SessionLocal()
     try:
-        interval = int(message.text)
-        if interval < 30:
-            await message.answer("❌ Минимум 30 минут.")
+        lic = db.query(LicenseKey).filter_by(key=key).first()
+        if not lic:
+            await message.answer("❌ Неверный ключ.", reply_markup=get_main_keyboard(message.from_user.id))
+            await state.finish()
             return
-        if interval > 120:
-            await message.answer("❌ Максимум 120 минут.")
+        if lic.is_used:
+            await message.answer("❌ Ключ использован.", reply_markup=get_main_keyboard(message.from_user.id))
+            await state.finish()
             return
         
-        data = await state.get_data()
-        account_ids = data.get('account_ids', [])
-        messages = data.get('messages', [])
-        safe_mode = data.get('safe_mode', False)
+        user = db.query(User).filter_by(user_id=message.from_user.id).first()
+        expiry = datetime.utcnow() + timedelta(days=lic.duration_days if lic.duration_days != -1 else 36500)
         
-        db = SessionLocal()
-        try:
-            task = BroadcastTask(
-                user_id=message.from_user.id,
-                account_ids=json.dumps(account_ids),
-                messages=json.dumps(messages),
-                interval_minutes=interval,
-                safe_mode=safe_mode,
-                status='active'
-            )
-            db.add(task)
-            db.commit()
-            db.refresh(task)
-            task_id = task.id
-        finally:
-            db.close()
-        
-        asyncio.create_task(start_broadcast(message.from_user.id, task_id))
+        user.license_key = key
+        user.license_expiry = expiry
+        lic.is_used = True
+        lic.used_by = user.user_id
+        db.commit()
         
         await message.answer(
-            f"✅ <b>Рассылка запущена!</b>\n\n"
-            f"📱 Аккаунтов: {len(account_ids)}\n"
-            f"📝 Текстов: {len(messages)}\n"
-            f"🛡 Режим: {'Безопасный' if safe_mode else 'Обычный'}\n"
-            f"⏱ Интервал: {interval} мин"
-            f"{' (±20%)' if safe_mode else ''}",
+            f"✅ <b>Лицензия активирована!</b>\n📅 До: <b>{expiry.strftime('%d.%m.%Y')}</b>",
             reply_markup=get_main_keyboard(message.from_user.id)
         )
         await state.finish()
-        
-    except ValueError:
-        await message.answer("❌ Введите число.")
-
-# Админ-панель
-@dp.message_handler(lambda message: message.text == "🔐 Админ-панель")
-async def admin_panel(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    await message.answer("🔐 <b>Админ-панель</b>", reply_markup=get_admin_keyboard())
-
-@dp.message_handler(lambda message: message.text == "📢 Рассылка всем")
-async def admin_broadcast_all(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    
-    await message.answer("📝 Введите текст для рассылки всем пользователям:", reply_markup=get_back_keyboard())
-    await UserStates.admin_broadcast.set()
-
-@dp.message_handler(state=UserStates.admin_broadcast)
-async def process_admin_broadcast(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад":
-        await state.finish()
-        await message.answer("Админ-панель:", reply_markup=get_admin_keyboard())
-        return
-    
-    db = SessionLocal()
-    try:
-        users = db.query(User).all()
-        count = 0
-        for user in users:
-            try:
-                await bot.send_message(user.user_id, f"📢 <b>Сообщение от администратора:</b>\n\n{message.text}")
-                count += 1
-            except:
-                continue
     finally:
         db.close()
-    
-    await message.answer(f"✅ Отправлено {count} пользователям.", reply_markup=get_admin_keyboard())
-    await state.finish()
-
-@dp.message_handler(lambda message: message.text == "🔑 Создать ключ")
-async def admin_create_key(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    await message.answer("🔑 Введите срок (дней, -1 = бессрочно):", reply_markup=get_back_keyboard())
-    await UserStates.admin_create_key.set()
 
 @dp.message_handler(state=UserStates.admin_create_key)
-async def process_key(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад":
-        await state.finish()
-        await message.answer("Админ-панель:", reply_markup=get_admin_keyboard())
-        return
-    
+async def process_admin_key(message: types.Message, state: FSMContext):
     try:
         duration = int(message.text)
         key = generate_license_key(duration)
@@ -723,151 +664,31 @@ async def process_key(message: types.Message, state: FSMContext):
         finally:
             db.close()
         
-        duration_text = "♾ Бессрочная" if duration == -1 else f"{duration} дн."
-        await message.answer(f"✅ Ключ: <code>{key}</code>\nСрок: {duration_text}", reply_markup=get_admin_keyboard())
+        await message.answer(f"✅ Ключ: <code>{key}</code>", reply_markup=get_main_keyboard(message.from_user.id))
         await state.finish()
     except ValueError:
         await message.answer("❌ Введите число.")
 
-@dp.message_handler(lambda message: message.text == "⚙️ Лимиты аккаунтов")
-async def admin_limits(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add(KeyboardButton("➕ Выдать"), KeyboardButton("➖ Забрать"))
-    keyboard.add(KeyboardButton("♾ Бесконечно"), KeyboardButton("❌ Обнулить"))
-    keyboard.add(KeyboardButton("🔙 Назад"))
-    
-    await message.answer("⚙️ <b>Лимиты аккаунтов</b>", reply_markup=keyboard)
-
-@dp.message_handler(lambda message: message.text == "➕ Выдать")
-async def admin_give(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    await message.answer("Введите: <code>ID количество</code>", reply_markup=get_back_keyboard())
-    await UserStates.admin_set_accounts.set()
-
-@dp.message_handler(lambda message: message.text == "♾ Бесконечно")
-async def admin_unlimited(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    await message.answer("Введите ID пользователя:", reply_markup=get_back_keyboard())
-    await UserStates.admin_give_unlimited.set()
-
-@dp.message_handler(lambda message: message.text == "❌ Обнулить")
-async def admin_zero(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    await message.answer("Введите ID пользователя:", reply_markup=get_back_keyboard())
-    await UserStates.admin_remove_all.set()
-
-@dp.message_handler(state=UserStates.admin_set_accounts)
-async def process_set_accounts(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад":
-        await state.finish()
-        await message.answer("Админ-панель:", reply_markup=get_admin_keyboard())
-        return
-    
-    try:
-        parts = message.text.split()
-        user_id = int(parts[0])
-        count = int(parts[1])
-        
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter_by(user_id=user_id).first()
-            if user:
-                user.max_accounts = count
-                db.commit()
-                await message.answer(f"✅ Лимит {count} акк. для {user_id}", reply_markup=get_admin_keyboard())
-            else:
-                await message.answer("❌ Не найден.")
-        finally:
-            db.close()
-        
-        await state.finish()
-    except:
-        await message.answer("❌ Формат: <code>ID количество</code>")
-
-@dp.message_handler(state=UserStates.admin_give_unlimited)
-async def process_unlimited(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад":
-        await state.finish()
-        await message.answer("Админ-панель:", reply_markup=get_admin_keyboard())
-        return
-    
-    try:
-        user_id = int(message.text)
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter_by(user_id=user_id).first()
-            if user:
-                user.max_accounts = 999999
-                db.commit()
-                await message.answer(f"✅ ♾ для {user_id}", reply_markup=get_admin_keyboard())
-        finally:
-            db.close()
-        await state.finish()
-    except:
-        await message.answer("❌ Введите ID.")
-
-@dp.message_handler(state=UserStates.admin_remove_all)
-async def process_remove_all(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад":
-        await state.finish()
-        await message.answer("Админ-панель:", reply_markup=get_admin_keyboard())
-        return
-    
-    try:
-        user_id = int(message.text)
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter_by(user_id=user_id).first()
-            if user:
-                user.max_accounts = 0
-                db.commit()
-                await message.answer(f"✅ Обнулено для {user_id}", reply_markup=get_admin_keyboard())
-        finally:
-            db.close()
-        await state.finish()
-    except:
-        await message.answer("❌ Введите ID.")
-
-# Статистика
-@dp.message_handler(lambda message: message.text == "📊 Статистика")
-async def show_stats(message: types.Message):
+@dp.message_handler(state=UserStates.admin_broadcast)
+async def process_admin_broadcast(message: types.Message, state: FSMContext):
     db = SessionLocal()
     try:
-        total_users = db.query(User).count()
-        total_accounts = db.query(Account).count()
-        total_broadcasts = db.query(BroadcastTask).count()
-        active_broadcasts = db.query(BroadcastTask).filter_by(status='active').count()
-        total_keys = db.query(LicenseKey).count()
-        used_keys = db.query(LicenseKey).filter_by(is_used=True).count()
-        
-        stats_text = f"""
-📊 <b>СТАТИСТИКА</b>
-
-👥 Пользователей: <b>{total_users}</b>
-📱 Аккаунтов: <b>{total_accounts}</b>
-📨 Рассылок: <b>{total_broadcasts}</b>
-🔄 Активных: <b>{active_broadcasts}</b>
-🔑 Ключей: <b>{total_keys}</b>
-📤 Использовано: <b>{used_keys}</b>
-"""
-        await message.answer(stats_text, reply_markup=get_main_keyboard(message.from_user.id))
+        users = db.query(User).all()
+        count = 0
+        for user in users:
+            try:
+                await bot.send_message(user.user_id, f"📢 <b>Сообщение:</b>\n\n{message.text}")
+                count += 1
+            except:
+                continue
     finally:
         db.close()
+    
+    await message.answer(f"✅ Отправлено {count} пользователям.", reply_markup=get_main_keyboard(message.from_user.id))
+    await state.finish()
 
-# Подключение аккаунта
 @dp.message_handler(state=UserStates.waiting_phone)
 async def process_phone(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад":
-        await state.finish()
-        await message.answer("Главное меню:", reply_markup=get_main_keyboard(message.from_user.id))
-        return
-    
     phone = message.text.strip()
     if not phone.startswith('+'):
         await message.answer("❌ Номер с '+'")
@@ -894,11 +715,6 @@ async def process_phone(message: types.Message, state: FSMContext):
 
 @dp.message_handler(state=UserStates.waiting_code)
 async def process_code(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад":
-        await state.finish()
-        await message.answer("Главное меню:", reply_markup=get_main_keyboard(message.from_user.id))
-        return
-    
     code = message.text.strip()
     data = await state.get_data()
     phone = data.get('phone')
@@ -935,11 +751,6 @@ async def process_code(message: types.Message, state: FSMContext):
 
 @dp.message_handler(state=UserStates.waiting_password)
 async def process_password(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад":
-        await state.finish()
-        await message.answer("Главное меню:", reply_markup=get_main_keyboard(message.from_user.id))
-        return
-    
     password = message.text.strip()
     data = await state.get_data()
     phone = data.get('phone')
@@ -969,49 +780,56 @@ async def process_password(message: types.Message, state: FSMContext):
         await message.answer(f"❌ Ошибка: {str(e)}")
         await state.finish()
 
-# Активация лицензии
-@dp.message_handler(lambda message: message.text == "🔑 Активировать лицензию")
-async def activate_license(message: types.Message):
-    await message.answer("🔑 Введите ключ:", reply_markup=get_back_keyboard())
-    await UserStates.waiting_license.set()
-
-@dp.message_handler(state=UserStates.waiting_license)
-async def process_license(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад":
-        await state.finish()
-        await message.answer("Главное меню:", reply_markup=get_main_keyboard(message.from_user.id))
+@dp.message_handler(state=UserStates.waiting_interval)
+async def process_text(message: types.Message, state: FSMContext):
+    messages = [m.strip() for m in message.text.split('|||') if m.strip()]
+    data = await state.get_data()
+    safe_mode = data.get('safe_mode', False)
+    
+    if safe_mode and len(messages) < 3:
+        await message.answer("❌ Нужно 3 текста!")
         return
     
-    key = message.text.strip()
-    db = SessionLocal()
+    await state.update_data(messages=messages)
+    await message.answer("⏱ Интервал (30-120 мин):", reply_markup=get_back_keyboard())
+    await UserStates.waiting_more_messages.set()
+
+@dp.message_handler(state=UserStates.waiting_more_messages)
+async def process_final(message: types.Message, state: FSMContext):
     try:
-        lic = db.query(LicenseKey).filter_by(key=key).first()
-        if not lic:
-            await message.answer("❌ Неверный ключ.")
-            return
-        if lic.is_used:
-            await message.answer("❌ Ключ использован.")
+        interval = int(message.text)
+        if interval < 30 or interval > 120:
+            await message.answer("❌ 30-120 минут.")
             return
         
-        user = db.query(User).filter_by(user_id=message.from_user.id).first()
-        if lic.duration_days == -1:
-            expiry = datetime.utcnow() + timedelta(days=36500)
-        else:
-            expiry = datetime.utcnow() + timedelta(days=lic.duration_days)
+        data = await state.get_data()
+        db = SessionLocal()
+        try:
+            task = BroadcastTask(
+                user_id=message.from_user.id,
+                account_ids=json.dumps(data.get('account_ids', [])),
+                messages=json.dumps(data.get('messages', [])),
+                interval_minutes=interval,
+                safe_mode=data.get('safe_mode', False),
+                status='active'
+            )
+            db.add(task)
+            db.commit()
+            db.refresh(task)
+            task_id = task.id
+        finally:
+            db.close()
         
-        user.license_key = key
-        user.license_expiry = expiry
-        lic.is_used = True
-        lic.used_by = user.user_id
-        db.commit()
+        asyncio.create_task(start_broadcast(message.from_user.id, task_id))
         
         await message.answer(
-            f"✅ <b>Лицензия активирована!</b>\n📅 До: <b>{expiry.strftime('%d.%m.%Y')}</b>",
+            f"✅ <b>Рассылка запущена!</b>\n"
+            f"⏱ Интервал: {interval} мин",
             reply_markup=get_main_keyboard(message.from_user.id)
         )
         await state.finish()
-    finally:
-        db.close()
+    except ValueError:
+        await message.answer("❌ Введите число.")
 
 # Startup
 async def on_startup(dp):
