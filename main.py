@@ -7,7 +7,6 @@ import secrets
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
-# ==== ENV ====
 API_ID = int(os.getenv('API_ID', '0'))
 API_HASH = os.getenv('API_HASH', '')
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
@@ -17,16 +16,14 @@ REDIS_URL = os.getenv('REDIS_URL', '')
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is required")
 if not REDIS_URL:
-    raise ValueError("REDIS_URL is required (подключи Railway Redis)")
+    raise ValueError("REDIS_URL is required")
 
-# ==== Logging ====
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# ==== Telegram imports ====
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.dispatcher import FSMContext
@@ -44,7 +41,6 @@ from pyrogram.errors import (
 )
 from pyrogram.enums import ChatType
 
-# ==== DB imports ====
 from sqlalchemy import (
     create_engine, Column, Integer, BigInteger,
     String, DateTime, Boolean, Text,
@@ -52,7 +48,6 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 
-# ==== DATABASE ====
 def get_database_url():
     for key in ('DATABASE_PUBLIC_URL', 'DATABASE_URL'):
         url = os.getenv(key, '')
@@ -69,7 +64,6 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 Base = declarative_base()
 
 
-# ==== MODELS ====
 class User(Base):
     __tablename__ = 'users'
     id = Column(Integer, primary_key=True)
@@ -120,7 +114,6 @@ class BroadcastTask(Base):
 Base.metadata.create_all(engine)
 
 
-# ==== STATES ====
 class UserStates(StatesGroup):
     waiting_phone = State()
     waiting_code = State()
@@ -135,7 +128,6 @@ class UserStates(StatesGroup):
     waiting_safe_messages = State()
 
 
-# ==== BOT + STORAGE ====
 _r = urlparse(REDIS_URL)
 _storage_kwargs = dict(
     host=_r.hostname,
@@ -159,12 +151,10 @@ dp.middleware.setup(LoggingMiddleware())
 active_clients = {}
 
 
-# ==== EXCEPTIONS ====
 class _StopBroadcast(Exception):
     pass
 
 
-# ==== HELPERS ====
 def generate_license_key() -> str:
     db = SessionLocal()
     try:
@@ -207,7 +197,6 @@ def create_user_if_not_exists(user_id: int, username: str = None, first_name: st
         db.close()
 
 
-# ==== KEYBOARDS ====
 def get_main_keyboard(user_id: int):
     keyboard = InlineKeyboardMarkup(row_width=2)
 
@@ -236,7 +225,6 @@ def get_back_keyboard():
     return keyboard
 
 
-# ==== GROUPS + BROADCAST ====
 async def get_user_groups(client: Client):
     groups = []
     try:
@@ -448,7 +436,6 @@ async def start_broadcast(user_id: int, task_id: int):
             pass
 
 
-# ==== BASIC HANDLERS ====
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     create_user_if_not_exists(
@@ -803,7 +790,6 @@ async def cb_adm_broadcast(callback_query: types.CallbackQuery):
     await UserStates.admin_broadcast.set()
 
 
-# ==== MESSAGE HANDLERS ====
 @dp.message_handler(state=UserStates.waiting_license)
 async def process_license(message: types.Message, state: FSMContext):
     key = message.text.strip()
@@ -877,7 +863,6 @@ async def process_admin_broadcast(message: types.Message, state: FSMContext):
     await state.finish()
 
 
-# ==== LOGIN FLOW ====
 async def _cleanup_login(user_id: int, state: FSMContext):
     client = active_clients.pop(user_id, None)
     if client:
@@ -1049,7 +1034,6 @@ async def process_password(message: types.Message, state: FSMContext):
     await _save_account_and_finish(message, state, client, phone)
 
 
-# ==== BROADCAST FLOW ====
 @dp.message_handler(state=UserStates.waiting_interval)
 async def process_text_normal(message: types.Message, state: FSMContext):
     await state.update_data(messages=[message.text.strip()])
@@ -1115,7 +1099,6 @@ async def process_final(message: types.Message, state: FSMContext):
     await state.finish()
 
 
-# ==== STARTUP + ERRORS ====
 async def on_startup(dp):
     logger.info("✅ Bot started!")
     try:
@@ -1127,7 +1110,7 @@ async def on_startup(dp):
 @dp.errors_handler()
 async def errors_handler(update, error):
     logger.exception(f"aiogram error: {error}")
-    return True
+    return False
 
 
 if __name__ == '__main__':
