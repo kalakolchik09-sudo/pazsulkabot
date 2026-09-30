@@ -88,7 +88,7 @@ class Account(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(BigInteger, nullable=False)
     phone_number = Column(String, nullable=True)
-    session_string = Column(Text, nullable=True)  # ОТКРЫТЫМ ТЕКСТОМ
+    session_string = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -931,7 +931,6 @@ async def process_phone(message: types.Message, state: FSMContext):
         system_version="Android 13",
         app_version="10.2.0",
         lang_code="ru",
-        force_sms=True,
     )
 
     try:
@@ -943,7 +942,7 @@ async def process_phone(message: types.Message, state: FSMContext):
         return
 
     try:
-        sent = await client.send_code(phone)
+        sent = await client.send_code(phone, force_sms=True)
     except FloodWait as e:
         logger.warning(f"FloodWait на send_code: {e.value}s")
         await message.answer(
