@@ -4,4 +4,3 @@ tgcrypto==1.2.5
 sqlalchemy==2.0.23
 psycopg2-binary==2.9.9
 redis==5.0.1
-aiogram-redis-storage==1.0.0
