@@ -7,7 +7,7 @@ import secrets
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
-BUILD_MARKER = "v4-2026-09-30-1730"
+BUILD_MARKER = "v5-2026-09-30-1830"
 
 API_ID = int(os.getenv('API_ID', '0'))
 API_HASH = os.getenv('API_HASH', '')
@@ -244,6 +244,15 @@ async def get_user_groups(client: Client):
     return groups
 
 
+async def _delete_account_from_db(acc_id: int):
+    db = SessionLocal()
+    try:
+        db.query(Account).filter_by(id=acc_id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
 async def start_broadcast(user_id: int, task_id: int):
     db = SessionLocal()
     try:
@@ -285,7 +294,9 @@ async def start_broadcast(user_id: int, task_id: int):
         try:
             await client.connect()
             if not await client.is_user_authorized():
-                logger.warning(f"{client.name}: не авторизован, пропускаю")
+                logger.warning(f"{client.name}: не авторизован, удаляю из БД")
+                acc_id = int(client.name.split("_")[1])
+                await _delete_account_from_db(acc_id)
                 try:
                     await client.disconnect()
                 except Exception:
@@ -301,11 +312,15 @@ async def start_broadcast(user_id: int, task_id: int):
                     alive_clients.append(client)
             except Exception:
                 logger.exception(f"{client.name}: не удалось переподключиться")
+        except AuthKeyUnregistered:
+            logger.error(f"{client.name}: AuthKeyUnregistered при connect, удаляю из БД")
+            acc_id = int(client.name.split("_")[1])
+            await _delete_account_from_db(acc_id)
         except Exception:
             logger.exception(f"{client.name}: ошибка подключения")
 
     if not alive_clients:
-        await bot.send_message(user_id, "❌ Все аккаунты невалидны (сессии отозваны).")
+        await bot.send_message(user_id, "❌ Все аккаунты невалидны (сессии отозваны) и удалены из базы.")
         return
 
     stop_keyboard = InlineKeyboardMarkup()
@@ -360,7 +375,9 @@ async def start_broadcast(user_id: int, task_id: int):
                         await asyncio.sleep(e.value)
                         continue
                     except (UserDeactivated, AuthKeyUnregistered):
-                        logger.error(f"{client.name}: аккаунт мёртв, снимаю с рассылки")
+                        logger.error(f"{client.name}: аккаунт мёртв, удаляю из БД")
+                        acc_id = int(client.name.split("_")[1])
+                        await _delete_account_from_db(acc_id)
                         if client in alive_clients:
                             alive_clients.remove(client)
                         break
@@ -457,19 +474,22 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
     await message.answer("Отменено.", reply_markup=get_main_keyboard(message.from_user.id))
 
 
-@dp.callback_query_handler(lambda c: c.data == "back")
+@dp.callback_query_handler(lambda c: c.data == "back", state='*')
 async def back(callback_query: types.CallbackQuery, state: FSMContext):
     await bot.answer_callback_query(callback_query.id)
     await _cleanup_login(callback_query.from_user.id, state)
-    await bot.edit_message_text(
-        "Главное меню:",
-        callback_query.from_user.id,
-        callback_query.message.message_id,
-        reply_markup=get_main_keyboard(callback_query.from_user.id),
-    )
+    try:
+        await bot.edit_message_text(
+            "Главное меню:",
+            callback_query.from_user.id,
+            callback_query.message.message_id,
+            reply_markup=get_main_keyboard(callback_query.from_user.id),
+        )
+    except Exception:
+        logger.exception("back: не удалось отредактировать сообщение")
 
 
-@dp.callback_query_handler(lambda c: c.data == "stop_all")
+@dp.callback_query_handler(lambda c: c.data == "stop_all", state='*')
 async def cb_stop_all(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     db = SessionLocal()
@@ -490,7 +510,7 @@ async def cb_stop_all(callback_query: types.CallbackQuery):
     )
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("stop_task_"))
+@dp.callback_query_handler(lambda c: c.data.startswith("stop_task_"), state='*')
 async def cb_stop_task(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id, "⏹ Останавливаю...")
     task_id = int(callback_query.data.split("_")[2])
@@ -511,7 +531,7 @@ async def cb_stop_task(callback_query: types.CallbackQuery):
     )
 
 
-@dp.callback_query_handler(lambda c: c.data == "menu_profile")
+@dp.callback_query_handler(lambda c: c.data == "menu_profile", state='*')
 async def cb_profile(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     db = SessionLocal()
@@ -550,7 +570,7 @@ async def cb_profile(callback_query: types.CallbackQuery):
         db.close()
 
 
-@dp.callback_query_handler(lambda c: c.data == "menu_stats")
+@dp.callback_query_handler(lambda c: c.data == "menu_stats", state='*')
 async def cb_stats(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     db = SessionLocal()
@@ -576,7 +596,7 @@ async def cb_stats(callback_query: types.CallbackQuery):
         db.close()
 
 
-@dp.callback_query_handler(lambda c: c.data == "menu_license")
+@dp.callback_query_handler(lambda c: c.data == "menu_license", state='*')
 async def cb_license(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     keyboard = InlineKeyboardMarkup()
@@ -590,7 +610,7 @@ async def cb_license(callback_query: types.CallbackQuery):
     await UserStates.waiting_license.set()
 
 
-@dp.callback_query_handler(lambda c: c.data == "menu_accounts")
+@dp.callback_query_handler(lambda c: c.data == "menu_accounts", state='*')
 async def cb_accounts(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     keyboard = InlineKeyboardMarkup(row_width=2)
@@ -607,7 +627,7 @@ async def cb_accounts(callback_query: types.CallbackQuery):
     )
 
 
-@dp.callback_query_handler(lambda c: c.data == "acc_add")
+@dp.callback_query_handler(lambda c: c.data == "acc_add", state='*')
 async def cb_acc_add(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     db = SessionLocal()
@@ -635,7 +655,7 @@ async def cb_acc_add(callback_query: types.CallbackQuery):
     await UserStates.waiting_phone.set()
 
 
-@dp.callback_query_handler(lambda c: c.data == "acc_list")
+@dp.callback_query_handler(lambda c: c.data == "acc_list", state='*')
 async def cb_acc_list(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     db = SessionLocal()
@@ -661,7 +681,7 @@ async def cb_acc_list(callback_query: types.CallbackQuery):
     )
 
 
-@dp.callback_query_handler(lambda c: c.data == "menu_broadcast")
+@dp.callback_query_handler(lambda c: c.data == "menu_broadcast", state='*')
 async def cb_broadcast(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     db = SessionLocal()
@@ -687,7 +707,7 @@ async def cb_broadcast(callback_query: types.CallbackQuery):
     )
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("sel_acc_"))
+@dp.callback_query_handler(lambda c: c.data.startswith("sel_acc_"), state='*')
 async def cb_select_account(callback_query: types.CallbackQuery, state: FSMContext):
     await bot.answer_callback_query(callback_query.id)
     if callback_query.data == "sel_acc_all":
@@ -715,7 +735,7 @@ async def cb_select_account(callback_query: types.CallbackQuery, state: FSMConte
     )
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("mode_"))
+@dp.callback_query_handler(lambda c: c.data.startswith("mode_"), state='*')
 async def cb_mode(callback_query: types.CallbackQuery, state: FSMContext):
     await bot.answer_callback_query(callback_query.id)
     safe_mode = callback_query.data == "mode_safe"
@@ -743,7 +763,7 @@ async def cb_mode(callback_query: types.CallbackQuery, state: FSMContext):
         await UserStates.waiting_interval.set()
 
 
-@dp.callback_query_handler(lambda c: c.data == "menu_admin")
+@dp.callback_query_handler(lambda c: c.data == "menu_admin", state='*')
 async def cb_admin(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     if callback_query.from_user.id != ADMIN_ID:
@@ -764,7 +784,7 @@ async def cb_admin(callback_query: types.CallbackQuery):
     )
 
 
-@dp.callback_query_handler(lambda c: c.data == "adm_key")
+@dp.callback_query_handler(lambda c: c.data == "adm_key", state='*')
 async def cb_adm_key(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     keyboard = InlineKeyboardMarkup()
@@ -778,7 +798,7 @@ async def cb_adm_key(callback_query: types.CallbackQuery):
     await UserStates.admin_create_key.set()
 
 
-@dp.callback_query_handler(lambda c: c.data == "adm_broadcast")
+@dp.callback_query_handler(lambda c: c.data == "adm_broadcast", state='*')
 async def cb_adm_broadcast(callback_query: types.CallbackQuery):
     await bot.answer_callback_query(callback_query.id)
     keyboard = InlineKeyboardMarkup()
@@ -1121,7 +1141,7 @@ def _dump_handlers():
     logger.info("CALLBACK HANDLERS:")
     try:
         for h in dp.callback_query_handlers.handlers:
-            logger.info(f"  {h.callback}")
+            logger.info(f"  {h}")
     except Exception:
         logger.exception("не удалось выгрузить хендлеры")
     logger.info("=" * 60)
