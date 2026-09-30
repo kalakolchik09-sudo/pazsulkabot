@@ -144,8 +144,8 @@ _storage_kwargs = dict(
     password=_r.password,
     pool_size=20,
     prefix='fsm',
-    state_ttl=3600,   # состояние FSM живёт 1 час
-    data_ttl=3600,    # данные FSM живут 1 час
+    state_ttl=3600,
+    data_ttl=3600,
 )
 if _r.scheme == 'rediss':
     _storage_kwargs['ssl'] = True
@@ -156,7 +156,6 @@ bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher(bot, storage=storage)
 dp.middleware.setup(LoggingMiddleware())
 
-# незавершённые клиенты логина (только в RAM)
 active_clients = {}
 
 
@@ -932,7 +931,7 @@ async def process_phone(message: types.Message, state: FSMContext):
         system_version="Android 13",
         app_version="10.2.0",
         lang_code="ru",
-        system_lang_code="ru-RU",
+        force_sms=True,
     )
 
     try:
