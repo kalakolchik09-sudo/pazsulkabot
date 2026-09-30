@@ -13,14 +13,11 @@ API_HASH = os.getenv('API_HASH', '')
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 REDIS_URL = os.getenv('REDIS_URL', '')
-SESSION_SECRET = os.getenv('SESSION_SECRET', '')
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is required")
 if not REDIS_URL:
     raise ValueError("REDIS_URL is required (подключи Railway Redis)")
-if not SESSION_SECRET:
-    raise ValueError("SESSION_SECRET is required (Fernet key, 44 символа base64)")
 
 # ==== Logging ====
 logging.basicConfig(
@@ -53,26 +50,6 @@ from sqlalchemy import (
     String, DateTime, Boolean, Text,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
-
-# ==== Crypto ====
-from cryptography.fernet import Fernet, InvalidToken
-
-try:
-    cipher = Fernet(SESSION_SECRET.encode() if isinstance(SESSION_SECRET, str) else SESSION_SECRET)
-except Exception as e:
-    raise ValueError(f"SESSION_SECRET не является валидным Fernet-ключом: {e}")
-
-
-def encrypt_session(s: str) -> str:
-    return cipher.encrypt(s.encode()).decode()
-
-
-def decrypt_session(token: str) -> str:
-    try:
-        return cipher.decrypt(token.encode()).decode()
-    except InvalidToken:
-        raise ValueError("Не удалось расшифровать session_string — неверный SESSION_SECRET?")
-
 
 # ==== DATABASE ====
 def get_database_url():
@@ -110,7 +87,7 @@ class Account(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(BigInteger, nullable=False)
     phone_number = Column(String, nullable=True)
-    session_string = Column(Text, nullable=True)  # шифрованный
+    session_string = Column(Text, nullable=True)  # ОТКРЫТЫМ ТЕКСТОМ
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -176,8 +153,8 @@ bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher(bot, storage=storage)
 dp.middleware.setup(LoggingMiddleware())
 
-# незавершённые клиенты логина (только в RAM, это ок)
-active_clients: dict[int, Client] = {}
+# незавершённые клиенты логина (RAM)
+active_clients: dict = {}
 
 
 # ==== EXCEPTIONS ====
@@ -297,16 +274,11 @@ async def start_broadcast(user_id: int, task_id: int):
         for acc_id in account_ids:
             account = db.query(Account).filter_by(id=acc_id).first()
             if account and account.session_string:
-                try:
-                    sess = decrypt_session(account.session_string)
-                except Exception:
-                    logger.exception(f"Не удалось расшифровать session_string для аккаунта {acc_id}")
-                    continue
                 clients.append(Client(
                     f"acc_{acc_id}",
                     api_id=API_ID,
                     api_hash=API_HASH,
-                    session_string=sess,
+                    session_string=account.session_string,
                     in_memory=True,
                 ))
     finally:
@@ -886,12 +858,12 @@ async def process_admin_key(message: types.Message, state: FSMContext):
 @dp.message_handler(state=UserStates.admin_broadcast)
 async def process_admin_broadcast(message: types.Message, state: FSMContext):
     db = SessionLocal()
-    count = 0
     try:
         users = db.query(User).all()
     finally:
         db.close()
 
+    count = 0
     for user in users:
         try:
             await bot.send_message(user.user_id, f"📢 <b>Сообщение:</b>\n\n{message.text}")
@@ -926,14 +898,12 @@ async def _save_account_and_finish(message: types.Message, state: FSMContext, cl
         await _cleanup_login(message.from_user.id, state)
         return
 
-    encrypted = encrypt_session(session_string)
-
     db = SessionLocal()
     try:
         db.add(Account(
             user_id=message.from_user.id,
             phone_number=phone,
-            session_string=encrypted,
+            session_string=session_string,  # ОТКРЫТЫМ ТЕКСТОМ
         ))
         db.commit()
     finally:
