@@ -51,6 +51,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+
 # ==== DATABASE ====
 def get_database_url():
     for key in ('DATABASE_PUBLIC_URL', 'DATABASE_URL'):
@@ -143,6 +144,8 @@ _storage_kwargs = dict(
     password=_r.password,
     pool_size=20,
     prefix='fsm',
+    state_ttl=3600,   # состояние FSM живёт 1 час
+    data_ttl=3600,    # данные FSM живут 1 час
 )
 if _r.scheme == 'rediss':
     _storage_kwargs['ssl'] = True
@@ -153,8 +156,8 @@ bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher(bot, storage=storage)
 dp.middleware.setup(LoggingMiddleware())
 
-# незавершённые клиенты логина (RAM)
-active_clients: dict = {}
+# незавершённые клиенты логина (только в RAM)
+active_clients = {}
 
 
 # ==== EXCEPTIONS ====
@@ -903,7 +906,7 @@ async def _save_account_and_finish(message: types.Message, state: FSMContext, cl
         db.add(Account(
             user_id=message.from_user.id,
             phone_number=phone,
-            session_string=session_string,  # ОТКРЫТЫМ ТЕКСТОМ
+            session_string=session_string,
         ))
         db.commit()
     finally:
