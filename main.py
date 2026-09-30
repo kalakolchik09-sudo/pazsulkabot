@@ -7,6 +7,8 @@ import secrets
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
+BUILD_MARKER = "v4-2026-09-30-1730"
+
 API_ID = int(os.getenv('API_ID', '0'))
 API_HASH = os.getenv('API_HASH', '')
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
@@ -902,6 +904,7 @@ async def _save_account_and_finish(message: types.Message, state: FSMContext, cl
 
 @dp.message_handler(state=UserStates.waiting_phone)
 async def process_phone(message: types.Message, state: FSMContext):
+    logger.info(f"[process_phone] BUILD={BUILD_MARKER} phone={message.text.strip()}")
     phone = message.text.strip()
     if not phone.startswith('+'):
         await message.answer("❌ Номер должен начинаться с '+'")
@@ -927,7 +930,7 @@ async def process_phone(message: types.Message, state: FSMContext):
         return
 
     try:
-        sent = await client.send_code(phone, force_sms=True)
+        sent = await client.send_code(phone)
     except FloodWait as e:
         logger.warning(f"FloodWait на send_code: {e.value}s")
         await message.answer(
@@ -1100,9 +1103,9 @@ async def process_final(message: types.Message, state: FSMContext):
 
 
 async def on_startup(dp):
-    logger.info("✅ Bot started!")
+    logger.info(f"✅ Bot started! BUILD={BUILD_MARKER}")
     try:
-        await bot.send_message(ADMIN_ID, "✅ Бот запущен!")
+        await bot.send_message(ADMIN_ID, f"✅ Бот запущен! BUILD={BUILD_MARKER}")
     except Exception:
         pass
 
@@ -1113,6 +1116,18 @@ async def errors_handler(update, error):
     return False
 
 
+def _dump_handlers():
+    logger.info("=" * 60)
+    logger.info("CALLBACK HANDLERS:")
+    try:
+        for h in dp.callback_query_handlers.handlers:
+            logger.info(f"  {h.callback}")
+    except Exception:
+        logger.exception("не удалось выгрузить хендлеры")
+    logger.info("=" * 60)
+
+
 if __name__ == '__main__':
+    _dump_handlers()
     logger.info("🚀 Starting bot...")
     executor.start_polling(dp, on_startup=on_startup, skip_updates=True)
