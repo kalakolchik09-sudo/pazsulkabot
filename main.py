@@ -7,7 +7,7 @@ import secrets
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
-BUILD_MARKER = "v6-old-logic-2026-09-30"
+BUILD_MARKER = "v6-old-logic-2026-09-30-fixed"
 
 API_ID = int(os.getenv('API_ID', '0'))
 API_HASH = os.getenv('API_HASH', '')
@@ -279,11 +279,14 @@ async def start_broadcast(user_id: int, task_id: int):
         for acc_id in account_ids:
             account = db.query(Account).filter_by(id=acc_id).first()
             if account and account.session_string:
+                # ВАЖНО: in_memory=True, чтобы использовалась именно session_string,
+                # а не файл сессии на диске. Иначе аккаунт "не авторизован".
                 client = Client(
                     f"b_{acc_id}_{task_id}",
                     api_id=API_ID,
                     api_hash=API_HASH,
                     session_string=account.session_string,
+                    in_memory=True,
                 )
                 clients.append(client)
     finally:
