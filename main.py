@@ -7,7 +7,7 @@ import secrets
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
-BUILD_MARKER = "v5-2026-09-30-1830"
+BUILD_MARKER = "v6-old-logic-2026-09-30"
 
 API_ID = int(os.getenv('API_ID', '0'))
 API_HASH = os.getenv('API_HASH', '')
@@ -150,14 +150,16 @@ bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher(bot, storage=storage)
 dp.middleware.setup(LoggingMiddleware())
 
+# как в старом коде — отдельные словари для активных клиентов и хешей кода
 active_clients = {}
+phone_code_hashes = {}
 
 
 class _StopBroadcast(Exception):
     pass
 
 
-def generate_license_key() -> str:
+def generate_license_key(duration_days: int = 30) -> str:
     db = SessionLocal()
     try:
         while True:
@@ -227,10 +229,11 @@ def get_back_keyboard():
     return keyboard
 
 
+# === как в старом коде: get_dialogs(limit=None) ===
 async def get_user_groups(client: Client):
     groups = []
     try:
-        async for dialog in client.get_dialogs():
+        async for dialog in client.get_dialogs(limit=None):
             if dialog.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
                 groups.append({
                     'id': dialog.chat.id,
@@ -239,8 +242,8 @@ async def get_user_groups(client: Client):
     except FloodWait as e:
         logger.warning(f"get_dialogs FloodWait {e.value}s")
         await asyncio.sleep(e.value)
-    except Exception:
-        logger.exception("get_dialogs упал")
+    except Exception as e:
+        logger.error(f"Error getting groups: {e}")
     return groups
 
 
@@ -253,6 +256,7 @@ async def _delete_account_from_db(acc_id: int):
         db.close()
 
 
+# === как в старом коде: client.start() / client.stop(), динамическое имя сессии ===
 async def start_broadcast(user_id: int, task_id: int):
     db = SessionLocal()
     try:
@@ -275,13 +279,13 @@ async def start_broadcast(user_id: int, task_id: int):
         for acc_id in account_ids:
             account = db.query(Account).filter_by(id=acc_id).first()
             if account and account.session_string:
-                clients.append(Client(
-                    f"acc_{acc_id}",
+                client = Client(
+                    f"b_{acc_id}_{task_id}",
                     api_id=API_ID,
                     api_hash=API_HASH,
                     session_string=account.session_string,
-                    in_memory=True,
-                ))
+                )
+                clients.append(client)
     finally:
         db.close()
 
@@ -292,13 +296,16 @@ async def start_broadcast(user_id: int, task_id: int):
     alive_clients = []
     for client in clients:
         try:
-            await client.connect()
+            await client.start()
             if not await client.is_user_authorized():
                 logger.warning(f"{client.name}: не авторизован, удаляю из БД")
-                acc_id = int(client.name.split("_")[1])
-                await _delete_account_from_db(acc_id)
                 try:
-                    await client.disconnect()
+                    acc_id = int(client.name.split("_")[1])
+                    await _delete_account_from_db(acc_id)
+                except Exception:
+                    pass
+                try:
+                    await client.stop()
                 except Exception:
                     pass
                 continue
@@ -307,15 +314,18 @@ async def start_broadcast(user_id: int, task_id: int):
             logger.warning(f"{client.name}: FloodWait {e.value}s при connect")
             await asyncio.sleep(e.value)
             try:
-                await client.connect()
+                await client.start()
                 if await client.is_user_authorized():
                     alive_clients.append(client)
             except Exception:
                 logger.exception(f"{client.name}: не удалось переподключиться")
         except AuthKeyUnregistered:
-            logger.error(f"{client.name}: AuthKeyUnregistered при connect, удаляю из БД")
-            acc_id = int(client.name.split("_")[1])
-            await _delete_account_from_db(acc_id)
+            logger.error(f"{client.name}: AuthKeyUnregistered, удаляю из БД")
+            try:
+                acc_id = int(client.name.split("_")[1])
+                await _delete_account_from_db(acc_id)
+            except Exception:
+                pass
         except Exception:
             logger.exception(f"{client.name}: ошибка подключения")
 
@@ -331,11 +341,12 @@ async def start_broadcast(user_id: int, task_id: int):
 
     status_msg = await bot.send_message(
         user_id,
-        f"🚀 <b>Рассылка запущена</b>\n"
+        f"🚀 <b>Рассылка запущена!</b>\n\n"
         f"📱 Аккаунтов: {len(alive_clients)}\n"
         f"📝 Текстов: {len(messages)}\n"
         f"🛡 Режим: {'Безопасный' if safe_mode else 'Обычный'}\n"
-        f"⏱ Интервал: {interval_minutes} мин",
+        f"⏱ Интервал: {interval_minutes} мин\n\n"
+        f"⏳ Начинаю...",
         reply_markup=stop_keyboard,
     )
 
@@ -346,10 +357,10 @@ async def start_broadcast(user_id: int, task_id: int):
         while True:
             db = SessionLocal()
             try:
-                current = db.query(BroadcastTask).filter_by(id=task_id).first()
+                current_task = db.query(BroadcastTask).filter_by(id=task_id).first()
             finally:
                 db.close()
-            if not current or current.status != 'active':
+            if not current_task or current_task.status != 'active':
                 break
 
             cycle += 1
@@ -360,24 +371,53 @@ async def start_broadcast(user_id: int, task_id: int):
                 for group in groups:
                     db = SessionLocal()
                     try:
-                        check = db.query(BroadcastTask).filter_by(id=task_id).first()
+                        check_task = db.query(BroadcastTask).filter_by(id=task_id).first()
                     finally:
                         db.close()
-                    if not check or check.status != 'active':
+                    if not check_task or check_task.status != 'active':
                         raise _StopBroadcast()
 
-                    text = random.choice(messages)
+                    message_text = random.choice(messages)
+
                     try:
-                        await client.send_message(group['id'], text)
+                        await client.send_message(group['id'], message_text)
                         total_sent += 1
+
+                        db = SessionLocal()
+                        try:
+                            db.query(BroadcastTask).filter_by(id=task_id).update({
+                                'current_cycle': cycle,
+                                'sent_count': total_sent,
+                                'groups_count': len(groups),
+                            })
+                            db.commit()
+                        finally:
+                            db.close()
+
+                        try:
+                            await status_msg.edit_text(
+                                f"🔄 <b>Цикл {cycle}</b>\n\n"
+                                f"📨 Отправлено: <b>{total_sent}</b>\n"
+                                f"👥 Групп: {len(groups)}\n"
+                                f"⏳ Продолжаю...",
+                                reply_markup=stop_keyboard,
+                            )
+                        except Exception:
+                            pass
+
+                        await asyncio.sleep(1)
+
                     except FloodWait as e:
                         logger.warning(f"FloodWait {e.value}s в {group['id']}")
                         await asyncio.sleep(e.value)
                         continue
                     except (UserDeactivated, AuthKeyUnregistered):
                         logger.error(f"{client.name}: аккаунт мёртв, удаляю из БД")
-                        acc_id = int(client.name.split("_")[1])
-                        await _delete_account_from_db(acc_id)
+                        try:
+                            acc_id = int(client.name.split("_")[1])
+                            await _delete_account_from_db(acc_id)
+                        except Exception:
+                            pass
                         if client in alive_clients:
                             alive_clients.remove(client)
                         break
@@ -391,29 +431,6 @@ async def start_broadcast(user_id: int, task_id: int):
                         logger.error(f"{client.name} → {group['id']}: {type(e).__name__}: {e}")
                         continue
 
-                    db = SessionLocal()
-                    try:
-                        db.query(BroadcastTask).filter_by(id=task_id).update({
-                            'current_cycle': cycle,
-                            'sent_count': total_sent,
-                            'groups_count': len(groups),
-                        })
-                        db.commit()
-                    finally:
-                        db.close()
-
-                    try:
-                        await status_msg.edit_text(
-                            f"🔄 <b>Цикл {cycle}</b>\n"
-                            f"📨 Отправлено: <b>{total_sent}</b>\n"
-                            f"📱 Аккаунтов активно: {len(alive_clients)}",
-                            reply_markup=stop_keyboard,
-                        )
-                    except Exception:
-                        pass
-
-                    await asyncio.sleep(1)
-
             if not alive_clients:
                 break
 
@@ -424,31 +441,41 @@ async def start_broadcast(user_id: int, task_id: int):
             else:
                 interval_seconds = interval_minutes * 60
 
+            try:
+                await status_msg.edit_text(
+                    f"✅ <b>Цикл {cycle} завершён</b>\n\n"
+                    f"📨 Всего: <b>{total_sent}</b>\n"
+                    f"⏱ Следующий через ~{interval_seconds // 60} мин",
+                    reply_markup=stop_keyboard,
+                )
+            except Exception:
+                pass
+
             for _ in range(interval_seconds // 5):
                 db = SessionLocal()
                 try:
-                    check = db.query(BroadcastTask).filter_by(id=task_id).first()
+                    check_task = db.query(BroadcastTask).filter_by(id=task_id).first()
                 finally:
                     db.close()
-                if not check or check.status != 'active':
+                if not check_task or check_task.status != 'active':
                     raise _StopBroadcast()
                 await asyncio.sleep(5)
 
     except _StopBroadcast:
         pass
-    except Exception:
-        logger.exception("start_broadcast упал")
+    except Exception as e:
+        logger.error(f"Broadcast error: {e}")
     finally:
         for client in clients:
             try:
-                await client.disconnect()
+                await client.stop()
             except Exception:
                 pass
 
         try:
             await status_msg.edit_text(
-                f"⏹ <b>Рассылка остановлена</b>\n"
-                f"📨 Всего: <b>{total_sent}</b>\n"
+                f"⏹ <b>Рассылка остановлена</b>\n\n"
+                f"📨 Всего отправлено: <b>{total_sent}</b>\n"
                 f"🔄 Циклов: <b>{cycle}</b>",
             )
         except Exception:
@@ -853,7 +880,7 @@ async def process_admin_key(message: types.Message, state: FSMContext):
         await message.answer("❌ Введи число.")
         return
 
-    key = generate_license_key()
+    key = generate_license_key(duration)
     db = SessionLocal()
     try:
         db.add(LicenseKey(key=key, duration_days=duration))
@@ -892,6 +919,7 @@ async def _cleanup_login(user_id: int, state: FSMContext):
             await client.disconnect()
         except Exception:
             pass
+    phone_code_hashes.pop(user_id, None)
     try:
         await state.finish()
     except Exception:
@@ -922,6 +950,7 @@ async def _save_account_and_finish(message: types.Message, state: FSMContext, cl
     await message.answer("✅ <b>Аккаунт добавлен!</b>", reply_markup=get_main_keyboard(message.from_user.id))
 
 
+# === КАК В СТАРОМ КОДЕ: Client(..., in_memory=True), phone_code_hash в словаре ===
 @dp.message_handler(state=UserStates.waiting_phone)
 async def process_phone(message: types.Message, state: FSMContext):
     logger.info(f"[process_phone] BUILD={BUILD_MARKER} phone={message.text.strip()}")
@@ -931,26 +960,23 @@ async def process_phone(message: types.Message, state: FSMContext):
         return
 
     client = Client(
-        name="tmp_login",
+        f"s_{message.from_user.id}_{len(phone_code_hashes)}",
         api_id=API_ID,
         api_hash=API_HASH,
         in_memory=True,
-        device_model="Samsung Galaxy S21",
-        system_version="Android 13",
-        app_version="10.2.0",
-        lang_code="ru",
     )
 
     try:
         await client.connect()
-    except Exception as e:
-        logger.exception("Не удалось подключиться к Telegram")
-        await message.answer(f"❌ Не удалось подключиться к Telegram: {e}")
-        await state.finish()
-        return
-
-    try:
-        sent = await client.send_code(phone)
+        sent_code = await client.send_code(phone)
+        await state.update_data(phone=phone)
+        phone_code_hashes[message.from_user.id] = sent_code.phone_code_hash
+        active_clients[message.from_user.id] = client
+        await message.answer(
+            "📨 Код отправлен! Введи код:",
+            reply_markup=get_back_keyboard(),
+        )
+        await UserStates.waiting_code.set()
     except FloodWait as e:
         logger.warning(f"FloodWait на send_code: {e.value}s")
         await message.answer(
@@ -962,53 +988,39 @@ async def process_phone(message: types.Message, state: FSMContext):
         except Exception:
             pass
         await state.finish()
-        return
     except Exception as e:
         logger.exception("send_code упал")
-        await message.answer(f"❌ Не удалось отправить код: {e}")
+        await message.answer(f"❌ Ошибка: {str(e)}")
         try:
             await client.disconnect()
         except Exception:
             pass
         await state.finish()
-        return
-
-    await state.update_data(phone=phone, phone_code_hash=sent.phone_code_hash)
-    active_clients[message.from_user.id] = client
-
-    await message.answer(
-        "📨 <b>Код отправлен.</b>\n\n"
-        "⚠️ Если у тебя уже открыт Telegram на другом устройстве — "
-        "код придёт в чат «Telegram» (служебный), а не по SMS.\n\n"
-        "Введи код:",
-        reply_markup=get_back_keyboard(),
-    )
-    await UserStates.waiting_code.set()
 
 
+# === КАК В СТАРОМ КОДЕ: sign_in(phone, phone_code_hash, code) — позиционные ===
 @dp.message_handler(state=UserStates.waiting_code)
 async def process_code(message: types.Message, state: FSMContext):
     code = message.text.strip()
     data = await state.get_data()
     phone = data.get('phone')
-    phone_code_hash = data.get('phone_code_hash')
     client = active_clients.get(message.from_user.id)
+    phone_code_hash = phone_code_hashes.get(message.from_user.id)
 
-    if not client or not phone_code_hash or not phone:
-        await message.answer("❌ Сессия истекла. Начни заново: /start → Аккаунты → Добавить")
+    if not client or not phone_code_hash:
+        await message.answer("❌ Сессия истекла.")
         await _cleanup_login(message.from_user.id, state)
         return
 
     try:
-        await client.sign_in(
-            phone_number=phone,
-            phone_code_hash=phone_code_hash,
-            phone_code=code,
-        )
-    except SessionPasswordNeeded:
-        await message.answer("🔐 Введи пароль 2FA:", reply_markup=get_back_keyboard())
-        await UserStates.waiting_password.set()
-        return
+        try:
+            await client.sign_in(phone, phone_code_hash, code)
+        except SessionPasswordNeeded:
+            await message.answer("🔐 Введи пароль 2FA:", reply_markup=get_back_keyboard())
+            await UserStates.waiting_password.set()
+            return
+
+        await _save_account_and_finish(message, state, client, phone)
     except PhoneCodeInvalid:
         await message.answer("❌ Неверный код. Попробуй ещё раз.")
         return
@@ -1021,11 +1033,8 @@ async def process_code(message: types.Message, state: FSMContext):
         return
     except Exception as e:
         logger.exception("sign_in упал")
-        await message.answer(f"❌ Ошибка входа: {e}")
+        await message.answer(f"❌ Ошибка: {str(e)}")
         await _cleanup_login(message.from_user.id, state)
-        return
-
-    await _save_account_and_finish(message, state, client, phone)
 
 
 @dp.message_handler(state=UserStates.waiting_password)
@@ -1035,13 +1044,14 @@ async def process_password(message: types.Message, state: FSMContext):
     phone = data.get('phone')
     client = active_clients.get(message.from_user.id)
 
-    if not client or not phone:
+    if not client:
         await message.answer("❌ Сессия истекла.")
         await _cleanup_login(message.from_user.id, state)
         return
 
     try:
         await client.check_password(password)
+        await _save_account_and_finish(message, state, client, phone)
     except PasswordHashInvalid:
         await message.answer("❌ Неверный пароль. Попробуй ещё раз.")
         return
@@ -1050,11 +1060,8 @@ async def process_password(message: types.Message, state: FSMContext):
         return
     except Exception as e:
         logger.exception("check_password упал")
-        await message.answer(f"❌ Ошибка: {e}")
+        await message.answer(f"❌ Ошибка: {str(e)}")
         await _cleanup_login(message.from_user.id, state)
-        return
-
-    await _save_account_and_finish(message, state, client, phone)
 
 
 @dp.message_handler(state=UserStates.waiting_interval)
@@ -1136,18 +1143,6 @@ async def errors_handler(update, error):
     return False
 
 
-def _dump_handlers():
-    logger.info("=" * 60)
-    logger.info("CALLBACK HANDLERS:")
-    try:
-        for h in dp.callback_query_handlers.handlers:
-            logger.info(f"  {h}")
-    except Exception:
-        logger.exception("не удалось выгрузить хендлеры")
-    logger.info("=" * 60)
-
-
 if __name__ == '__main__':
-    _dump_handlers()
     logger.info("🚀 Starting bot...")
     executor.start_polling(dp, on_startup=on_startup, skip_updates=True)
