@@ -4,3 +4,5 @@ tgcrypto==1.2.5
 sqlalchemy==2.0.23
 psycopg2-binary==2.9.9
 redis==5.0.1
+qrcode[pil]==7.4.2
+pillow==10.2.0
